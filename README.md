@@ -56,13 +56,15 @@ The CLI runs natively on Windows 10 and 11. It talks to the printer through the 
 
 **1. Pair the printer** in *Settings → Bluetooth & devices → Add device → Bluetooth*. Windows then also lists a "Standard Serial over Bluetooth link" port for it under *Device Manager → Ports (COM & LPT)*. That is just a sign that pairing worked; the CLI does not use that port.
 
-**2. Find the printer's Bluetooth address.** In PowerShell (replace `D30` if you renamed the device):
+**2. Get the program.** Either download `d30-cli-windows-x86_64.zip` from the `nightly` release on this repository's Releases page and unzip it (it is rebuilt automatically whenever a pull request is merged), or build it yourself: install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
+
+**3. Find the printer's Bluetooth address.**
 
 ```powershell
-(Get-PnpDevice -Class Bluetooth -FriendlyName 'D30').InstanceId -replace '.*DEV_(..)(..)(..)(..)(..)(..).*','$1:$2:$3:$4:$5:$6'
+d30-cli list-printers
 ```
 
-**3. Get the program.** Either download `d30-cli-windows-x86_64.zip` from the `nightly` release on this repository's Releases page and unzip it (it is rebuilt automatically whenever a pull request is merged), or build it yourself: install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
+This lists the Bluetooth devices paired with this PC, with their addresses, and points out the one that looks like a D30.
 
 **4. Print a label.**
 
@@ -73,6 +75,30 @@ d30-cli -t "Hello" --device AA:BB:CC:DD:EE:FF
 Put the address in the config file (see below) to leave out `--device`.
 
 The label preview (`--preview`) opens the image in Windows' default image viewer.
+
+## Labels, fonts and uncut tape
+
+`print-text` prints on the 12 × 40 mm precut labels unless you say otherwise.
+
+```sh
+d30-cli list-labels                                       # the labels and tape the printer can use
+d30-cli list-fonts                                        # the fonts you can pick
+d30-cli print-text "Hello" --label 14x50                  # another size of precut label
+d30-cli print-text 'Kitchen\nPantry' --font Arial --bold --align left
+d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to fit the text
+```
+
+* `--label` takes a name from `list-labels`, or any size: `12x35` is a precut label 12 mm wide and 35 mm long, and `13-continuous` is uncut tape 13 mm wide. The D30 prints a band 12 mm wide, so on wider tape (up to 15 mm) the text is centred with a margin on each side.
+* `\n` in the text starts a new line, and `--align` lines the lines up left, center or right.
+* `--font` takes the name of an installed font (capitals do not matter) or the path of a font file, and `--bold` and `--italic` pick that style of the font if it has one. Without `--font` the built-in DejaVu Sans is used.
+* `--save-image label.png` also saves the label as a picture, one pixel for each dot, which is exactly what gets printed. Together with `--dry-run` that works without a printer.
+
+**Uncut tape.** The label is cut to fit the text, or as long as you say with `--length 60` (in mm). Two things are different from precut labels:
+
+* The print head sits about 7 mm behind the edge you tear the tape on, so the end of a label is still inside the printer when it has been printed. The program feeds some blank tape after the label (`--feed-lines`, 134 by default) so that you can tear it off with its text in the middle.
+* The first rows a printer prints can come out squashed together while the tape gets moving. The program prints some blank tape before the label (`--lead-in-lines`, 30 by default) to take that.
+
+**What has been tried.** Only the 12 × 40 mm precut labels and 15 mm uncut tape have been tried on a real D30. The other sizes come from Phomemo's own listings and from other D30 drivers, so they should work, but `list-labels` marks them as not tried. Tape narrower than 12 mm is not supported, because the print head is 12 mm wide. Labels shaped for fruit are not supported yet.
 
 ## Configuration (imperative)
 

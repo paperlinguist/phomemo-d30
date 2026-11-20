@@ -5,6 +5,8 @@ use std::io::{self, Write};
 use advmac::MacAddr6;
 use bluetooth_serial_port_async::{BtAddr, BtProtocol, BtSocket};
 
+use super::PairedDevice;
+
 pub use bluetooth_serial_port_async::BtError as Error;
 
 /// An open RFCOMM connection to the printer.
@@ -27,6 +29,14 @@ impl Write for RfcommStream {
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
     }
+}
+
+/// Not implemented on Linux yet: use `bluetoothctl devices` to see the paired devices.
+pub fn list_paired_devices() -> io::Result<Vec<PairedDevice>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "listing paired devices is not implemented on Linux yet; run `bluetoothctl devices` instead",
+    ))
 }
 
 /// Advice for when the printer never answers; `addr` is its address as `AA:BB:CC:DD:EE:FF`.
