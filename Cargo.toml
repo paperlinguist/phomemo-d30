@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["d30", "cli", "cli-preview"]
+# The GUI is a workspace of its own (see gui/Cargo.toml): the egui version it needs cannot share
+# a lockfile with the show-image preview helper, which pins an old web-sys.
+exclude = ["gui"]
 
 package.version = "0.2.3"
 package.edition = "2021"
