@@ -56,7 +56,7 @@ The CLI runs natively on Windows 10 and 11. It talks to the printer through the 
 
 **1. Pair the printer** in *Settings → Bluetooth & devices → Add device → Bluetooth*. Windows then also lists a "Standard Serial over Bluetooth link" port for it under *Device Manager → Ports (COM & LPT)*. That is just a sign that pairing worked; the CLI does not use that port.
 
-**2. Get the program.** Either download `d30-cli-windows-x86_64.zip` from the `nightly` release on this repository's Releases page and unzip it (it is rebuilt automatically whenever a pull request is merged), or build it yourself: install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
+**2. Get the programs.** Either download `d30-windows-x86_64.zip` from the `nightly` release on this repository's Releases page and unzip it (it is rebuilt automatically whenever a pull request is merged), or build them yourself: install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli` for the command line program and `cargo install --path gui --locked` for the label designer. The zip holds both: `d30-gui.exe`, the label designer described below, and `d30-cli.exe`.
 
 **3. Find the printer's Bluetooth address.**
 
@@ -75,6 +75,17 @@ d30-cli -t "Hello" --device AA:BB:CC:DD:EE:FF
 Put the address in the config file (see below) to leave out `--device`.
 
 The label preview (`--preview`) opens the image in Windows' default image viewer.
+
+## The label designer
+
+`d30-gui` is a window for making labels without the command line:
+
+* **Printer** (top): pick the printer from the Bluetooth devices your computer has paired (plus any printers named in the command line program's config file), then press **Connect**. The connection stays open, so printing starts at once; **Disconnect** frees the printer for other programs. **Pair…** opens Windows' Bluetooth settings, and **Refresh** looks again for paired printers. On Linux the list of paired devices is not available yet, so type the printer's address under "Other address…".
+* **Settings** (left): the text (Enter starts a new line), the font with bold and italic, the size or "as large as fits", alignment, margin, and the kind of label or tape. For uncut tape you can cut the label to fit the text or give a length.
+* **Preview** (middle): the label exactly as it will print, one square for each dot.
+* **Print** (bottom): how many copies, and the print button. Connecting and printing happen in the background, so the window never freezes while the printer is slow to answer.
+
+Your last printer, text and settings are remembered next time.
 
 ## Labels, fonts and uncut tape
 
