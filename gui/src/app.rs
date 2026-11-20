@@ -131,7 +131,11 @@ impl App {
             printing: false,
             status: Status {
                 level: Level::Info,
-                text: "Choose a printer, then print.".to_string(),
+                text: match choice {
+                    Choice::Device(_) => "Ready.",
+                    Choice::Other => "Choose a printer, or type its address.",
+                }
+                .to_string(),
             },
             help: None,
             preview: None,
@@ -170,6 +174,10 @@ impl App {
     }
 
     fn remember(&self) {
+        // Trying things out with `--screenshot` must not change what is remembered.
+        if self.screenshot.is_some() {
+            return;
+        }
         let printer = self.address().map(Self::address_text);
         if let Err(error) = Saved::new(&self.settings, printer).save() {
             log::warn!("Could not save the settings: {error}");
@@ -242,9 +250,13 @@ impl App {
                 }
                 Event::PrintFailed(error) => {
                     self.printing = false;
-                    // The printer thread closes the connection when a print fails.
-                    self.connection = Connection::Disconnected;
-                    self.say(Level::Bad, format!("Printing failed: {error}"));
+                    // When the print failed because the printer could not be reached, the
+                    // message about that, which says why, is already on show. Keep it.
+                    if !matches!(self.connection, Connection::Failed) {
+                        // The printer thread closes the connection when a print fails.
+                        self.connection = Connection::Disconnected;
+                        self.say(Level::Bad, format!("Printing failed: {error}"));
+                    }
                 }
             }
         }
