@@ -15,6 +15,11 @@ use snafu::{OptionExt, ResultExt, Snafu};
 #[cfg(all(feature = "bluetooth", any(target_os = "linux", windows)))]
 pub mod bt;
 
+pub mod fonts;
+pub mod protocol;
+pub mod render;
+pub mod stock;
+
 // These values are based on those used in polskafan's phomemo_d30 code, available here:
 // https://github.com/polskafan/phomemo_d30
 pub const INIT_BASE_FLAT: &[u8] = &[
@@ -157,6 +162,12 @@ pub enum D30Error {
 
     #[snafu(display("Could not init font"))]
     CouldNotInitFont,
+    #[snafu(display("Font not found: {name}"))]
+    FontNotFound { name: String },
+    #[snafu(display("Could not read font file {}", path.display()))]
+    CouldNotReadFontFile { path: PathBuf, source: io::Error },
+    #[snafu(display("Invalid label: {reason}"))]
+    InvalidLabel { reason: String },
 
     #[snafu(display("Failed to serialize TOML D30 config"))]
     CouldNotParse { source: toml::de::Error },
