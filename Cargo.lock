@@ -755,6 +755,7 @@ name = "d30"
 version = "0.2.3"
 dependencies = [
  "advmac",
+ "bluetooth-serial-port-async",
  "derive_more",
  "dimensions",
  "dirs",
@@ -769,6 +770,7 @@ dependencies = [
  "snafu",
  "tokio",
  "toml",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -776,7 +778,6 @@ name = "d30-cli"
 version = "0.2.3"
 dependencies = [
  "advmac",
- "bluetooth-serial-port-async",
  "clap",
  "d30",
  "derive_more",
@@ -798,7 +799,6 @@ dependencies = [
  "tokio",
  "toml",
  "unescape",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

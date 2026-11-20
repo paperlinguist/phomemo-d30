@@ -32,10 +32,3 @@ merge.workspace = true
 serde_merge.workspace = true
 png.workspace = true
 unescape.workspace = true
-
-# The Bluetooth transport is platform specific; see cli/src/bt/.
-[target.'cfg(target_os = "linux")'.dependencies]
-bluetooth-serial-port-async.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true

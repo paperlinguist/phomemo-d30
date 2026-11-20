@@ -11,6 +11,10 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 
+// The Bluetooth link to the printer. It differs per platform (BlueZ on Linux, Winsock on Windows).
+#[cfg(all(feature = "bluetooth", any(target_os = "linux", windows)))]
+pub mod bt;
+
 // These values are based on those used in polskafan's phomemo_d30 code, available here:
 // https://github.com/polskafan/phomemo_d30
 pub const INIT_BASE_FLAT: &[u8] = &[

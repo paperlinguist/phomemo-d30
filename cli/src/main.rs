@@ -12,6 +12,7 @@ use std::{
 
 use advmac::{MacAddr6, MacAddrFormat, ParseError};
 use clap::{Parser, Subcommand};
+use d30::bt;
 use d30::D30Scale;
 use image::{DynamicImage, ImageError, ImageFormat};
 use inquire::InquireError;
@@ -19,8 +20,8 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 
-// How we talk to the printer over Bluetooth differs per platform.
-mod bt;
+#[cfg(not(any(target_os = "linux", windows)))]
+compile_error!("d30-cli only has Bluetooth backends for Linux (BlueZ) and Windows (Winsock)");
 
 #[derive(Debug, Parser)]
 #[command(name = "d30")]
@@ -35,6 +36,8 @@ struct Arguments {
 enum Commands {
     #[clap(short_flag = 't')]
     PrintText(ArgsPrintText),
+    /// List the Bluetooth devices paired with this computer, to find the printer's address
+    ListPrinters,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -463,6 +466,33 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     Ok(())
 }
 
+fn cmd_list_printers() -> Result<(), CLIError> {
+    let devices = bt::list_paired_devices().context(IOSnafu {
+        task: "list the paired Bluetooth devices",
+    })?;
+    if devices.is_empty() {
+        println!("No paired Bluetooth devices found. Pair the printer with this computer first.");
+    }
+    for device in devices {
+        println!(
+            "{}  {}{}{}",
+            device.address.format_string(MacAddrFormat::ColonNotation),
+            device.name,
+            if device.connected {
+                "  (connected)"
+            } else {
+                ""
+            },
+            if device.looks_like_d30() {
+                "  <- looks like a D30"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
 #[snafu::report]
 #[tokio::main]
 async fn main() -> Result<(), CLIError> {
@@ -495,6 +525,7 @@ async fn main() -> Result<(), CLIError> {
         Commands::PrintText(args) => {
             cmd_print(&mut config, &args)?;
         }
+        Commands::ListPrinters => cmd_list_printers()?,
     }
 
     Ok(())

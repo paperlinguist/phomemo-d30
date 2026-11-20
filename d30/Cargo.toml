@@ -23,3 +23,15 @@ indexmap.workspace = true
 advmac.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[features]
+default = ["bluetooth"]
+# The Bluetooth link to the printer (BlueZ on Linux, Winsock on Windows). Turn it off to use only
+# the rendering and protocol parts of the library, for instance where libbluetooth is not installed.
+bluetooth = ["dep:bluetooth-serial-port-async", "dep:windows-sys"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluetooth-serial-port-async = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
