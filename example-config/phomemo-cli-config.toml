@@ -1,4 +1,7 @@
-# This can be "gio", "wezterm", "show_image", or some custom command
-preview = "gio"
+# How to show the label preview. This can be "system", "gio", "wezterm", "show_image",
+# or some custom command, e.g. { custom_command = ["mspaint"] }.
+# "system" opens the image with the OS's default viewer (explorer on Windows, xdg-open elsewhere).
+# If left out, the default is "system" on Windows and "gio" on Linux.
+# preview = "gio"
 # This can be true or false
 enable_preview = true

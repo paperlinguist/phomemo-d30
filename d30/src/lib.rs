@@ -156,8 +156,8 @@ pub enum D30Error {
 
     #[snafu(display("Failed to serialize TOML D30 config"))]
     CouldNotParse { source: toml::de::Error },
-    #[snafu(display("Could not get XDG path"))]
-    CouldNotGetXDGPath { source: xdg::BaseDirectoriesError },
+    #[snafu(display("Could not determine the user configuration directory"))]
+    CouldNotDetermineConfigDir,
     #[snafu(display("Could not place config file"))]
     CouldNotPlaceConfigFile { source: io::Error },
     #[snafu(display("No default device specified"))]
@@ -170,6 +170,25 @@ pub enum D30Error {
     CouldNotParseMacAddress,
 }
 
+/// Directory, inside the user's configuration directory, that holds all phomemo config files.
+const CONFIG_DIR_NAME: &str = "phomemo-library";
+
+/// Returns the path of the config file `file_name`, creating its parent directory if needed.
+///
+/// The file itself is not created. Where it lives follows the platform's conventions:
+///
+/// | Platform | Location                                                                    |
+/// | -------- | --------------------------------------------------------------------------- |
+/// | Linux    | `$XDG_CONFIG_HOME/phomemo-library/` (by default `~/.config/phomemo-library/`) |
+/// | Windows  | `%APPDATA%\phomemo-library\` (`C:\Users\<user>\AppData\Roaming\phomemo-library\`) |
+pub fn place_config_file(file_name: &str) -> Result<PathBuf, D30Error> {
+    let dir = dirs::config_dir()
+        .context(CouldNotDetermineConfigDirSnafu)?
+        .join(CONFIG_DIR_NAME);
+    fs::create_dir_all(&dir).context(CouldNotPlaceConfigFileSnafu)?;
+    Ok(dir.join(file_name))
+}
+
 impl D30Config {
     pub fn load_toml(path: &PathBuf) -> Result<Self, D30Error> {
         let contents = fs::read_to_string(path).context(CouldNotReadFileSnafu)?;
@@ -177,11 +196,7 @@ impl D30Config {
     }
 
     pub fn read_d30_config() -> Result<Self, D30Error> {
-        let phomemo_lib_path = xdg::BaseDirectories::with_prefix("phomemo-library")
-            .context(CouldNotGetXDGPathSnafu)?;
-        let config_path = phomemo_lib_path
-            .place_config_file("phomemo-config.toml")
-            .context(CouldNotPlaceConfigFileSnafu)?;
+        let config_path = place_config_file("phomemo-config.toml")?;
         let toml = D30Config::load_toml(&config_path);
         if let Err(e) = &toml {
             warn!("Failed to parse config file: {:#?}", e);

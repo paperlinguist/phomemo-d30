@@ -50,11 +50,35 @@ nix run github:crabdancing/phomemo-d30
 
 This will fetch dependencies, compile, and run the program all in one go.
 
+## CLI usage (Windows)
+
+The CLI runs natively on Windows 10 and 11. It talks to the printer through the Windows Bluetooth stack (an RFCOMM socket via Winsock), so no extra driver, COM port or WSL is needed.
+
+**1. Pair the printer** in *Settings → Bluetooth & devices → Add device → Bluetooth*. Windows then also lists a "Standard Serial over Bluetooth link" port for it under *Device Manager → Ports (COM & LPT)*. That is just a sign that pairing worked; the CLI does not use that port.
+
+**2. Find the printer's Bluetooth address.** In PowerShell (replace `D30` if you renamed the device):
+
+```powershell
+(Get-PnpDevice -Class Bluetooth -FriendlyName 'D30').InstanceId -replace '.*DEV_(..)(..)(..)(..)(..)(..).*','$1:$2:$3:$4:$5:$6'
+```
+
+**3. Get the program.** Install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
+
+**4. Print a label.**
+
+```powershell
+d30-cli -t "Hello" --device AA:BB:CC:DD:EE:FF
+```
+
+Put the address in the config file (see below) to leave out `--device`.
+
+The label preview (`--preview`) opens the image in Windows' default image viewer.
+
 ## Configuration (imperative)
 
 The program will work without any on-disk config, but if you want to use some of the more sophisticated features, here's a brief explanation of the current state of affairs.
 
-There are two config files. On Linux, they are stored under `$XDG_CONFIG_HOME/phomemo-library`. On most systems, that will be `~/.config/phomemo-library` -- so I'll be using that path in this mini-guide to make this more concrete.
+There are two config files. On Linux, they are stored under `$XDG_CONFIG_HOME/phomemo-library`. On most systems, that will be `~/.config/phomemo-library` -- so I'll be using that path in this mini-guide to make this more concrete. On Windows, they are stored under `%APPDATA%\phomemo-library`, which is usually `C:\Users\<you>\AppData\Roaming\phomemo-library`.
 
 Under this directory, it expects two config files. One is for the library itself:
 
