@@ -24,8 +24,8 @@ fn main() -> eframe::Result {
     let options = options_from_args();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([760.0, 460.0])
+            .with_inner_size(app::WINDOW_SIZE)
+            .with_min_inner_size(app::MIN_WINDOW_SIZE)
             .with_title("Phomemo D30 labels"),
         ..Default::default()
     };

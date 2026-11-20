@@ -25,6 +25,10 @@ use crate::{
     settings::{LabelSettings, Saved},
 };
 
+/// How big the window starts out, and the smallest it can be made, in points.
+pub const WINDOW_SIZE: [f32; 2] = [1000.0, 640.0];
+pub const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 460.0];
+
 /// What can be asked of the program on the command line. They are mostly for trying things out.
 #[derive(Default)]
 pub struct Options {
@@ -93,7 +97,29 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options) -> Self {
-        let saved = Saved::load();
+        let context = cc.egui_ctx.clone();
+        let printer = Printer::start(printer::Bluetooth, printer::CONNECT_ATTEMPTS, move || {
+            context.request_repaint()
+        });
+        Self::assemble(
+            Saved::load(),
+            devices::discover(),
+            Fonts::system(),
+            printer,
+            options,
+        )
+    }
+
+    /// Puts the window together from what the outside world has provided: what was remembered, the
+    /// printers that were found, the fonts and the printer thread. Split from [`Self::new`] so that
+    /// tests can supply their own.
+    fn assemble(
+        saved: Saved,
+        discovery: devices::Discovery,
+        fonts: Fonts,
+        printer: Printer,
+        options: Options,
+    ) -> Self {
         let mut settings = saved.settings();
         if let Some(text) = options.text {
             settings.text = text.replace("\\n", "\n");
@@ -105,7 +131,6 @@ impl App {
             settings.font = Some(font);
         }
 
-        let discovery = devices::discover();
         let saved_address = saved
             .printer
             .as_deref()
@@ -113,14 +138,9 @@ impl App {
         let (choice, manual_address) =
             initial_choice(&discovery.devices, saved_address, discovery.default_address);
 
-        let context = cc.egui_ctx.clone();
-        let printer = Printer::start(printer::Bluetooth, printer::CONNECT_ATTEMPTS, move || {
-            context.request_repaint()
-        });
-
         App {
             settings,
-            fonts: Fonts::system(),
+            fonts,
             devices: discovery.devices,
             devices_note: discovery.note,
             config_default: discovery.default_address,
@@ -314,7 +334,9 @@ impl App {
 
     fn printer_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        // Wrapped, so that in a narrow window the connection controls move to a second row
+        // instead of running off the edge.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Printer:");
             let shown = match self.choice {
                 Choice::Device(address) => self
@@ -598,14 +620,18 @@ impl App {
             if response.clicked() {
                 self.print();
             }
-
-            let color = match self.status.level {
-                Level::Info => ui.visuals().text_color(),
-                Level::Good => Color32::from_rgb(60, 170, 90),
-                Level::Bad => ui.visuals().error_fg_color,
-            };
-            ui.colored_label(color, &self.status.text);
         });
+
+        // On a row of its own and told to wrap: in a row of widgets a label never wraps, so a long
+        // message (Windows words "the printer is off" in about 190 characters) would run off the
+        // edge of the window.
+        let color = match self.status.level {
+            Level::Info => ui.visuals().text_color(),
+            Level::Good => Color32::from_rgb(60, 170, 90),
+            Level::Bad => ui.visuals().error_fg_color,
+        };
+        ui.add(egui::Label::new(RichText::new(&self.status.text).color(color)).wrap());
+
         if let Some(help) = &self.help {
             ui.collapsing("What to check", |ui| {
                 ui.label(help);
@@ -646,8 +672,9 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl App {
+    /// The whole window, once.
+    fn show(&mut self, ui: &mut egui::Ui) {
         self.handle_printer_events();
         self.update_preview(ui.ctx());
 
@@ -662,6 +689,12 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui));
 
         self.handle_screenshot(ui);
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
     }
 
     fn on_exit(&mut self) {
@@ -716,6 +749,11 @@ fn initial_choice(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
     use super::*;
 
     fn device(name: &str, last_byte: u8) -> Device {
@@ -756,5 +794,155 @@ mod tests {
         assert_eq!(typed, "02:00:00:00:00:07");
         let (choice, typed) = initial_choice(&[], None, None);
         assert_eq!((choice, typed.as_str()), (Choice::Other, ""));
+    }
+
+    // ---- the window as a whole: is anything cut off? ----------------------------------------
+
+    /// A printer that can never be reached, as if it were switched off.
+    struct Unreachable;
+
+    impl printer::Transport for Unreachable {
+        type Stream = Vec<u8>;
+
+        fn connect(&self, _address: MacAddr6) -> Result<Vec<u8>, String> {
+            // Word for word what Windows says when the printer does not answer.
+            Err(
+                "A connection attempt failed because the connected party did not properly \
+                 respond after a period of time, or established connection failed because \
+                 connected host has failed to respond. (os error 10060)"
+                    .to_string(),
+            )
+        }
+    }
+
+    fn test_app() -> App {
+        let discovery = devices::Discovery {
+            devices: vec![device("D30", 1)],
+            ..Default::default()
+        };
+        App::assemble(
+            Saved::default(),
+            discovery,
+            Fonts::embedded(),
+            Printer::start(Unreachable, 1, || {}),
+            Options::default(),
+        )
+    }
+
+    /// Presses Connect on a printer that is switched off, and waits until the window has been told
+    /// that it could not connect.
+    fn failed_to_connect(app: &mut App) {
+        let address = app.address().expect("a printer is chosen");
+        app.printer.send(Command::Connect(address));
+        // The printer thread answers in its own time.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(app.connection, Connection::Failed) {
+            assert!(
+                Instant::now() < deadline,
+                "the printer thread never said that it could not connect"
+            );
+            app.handle_printer_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A piece of text as drawn on the screen.
+    struct Shown {
+        text: String,
+        lines: usize,
+        /// How far to the right the text reaches, in points.
+        right: f32,
+    }
+
+    /// Lays the window out on a screen of this size, as egui would draw it, and returns the text.
+    fn lay_out(app: &mut App, [width, height]: [f32; 2]) -> Vec<Shown> {
+        fn collect(shape: &egui::Shape, shown: &mut Vec<Shown>) {
+            match shape {
+                egui::Shape::Text(text) => shown.push(Shown {
+                    text: text.galley.text().to_string(),
+                    lines: text.galley.rows.len(),
+                    right: text.visual_bounding_rect().right(),
+                }),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, shown)),
+                _ => {}
+            }
+        }
+
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+        let mut shown = Vec::new();
+        // Panels and the like find their sizes over a few frames, so keep what the last one drew.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let output = context.run_ui(input, |ui| app.show(ui));
+            shown.clear();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shown);
+            }
+            output.drop_without_applying_deltas();
+        }
+        shown
+    }
+
+    /// Asserts that no text reaches past the right edge of the window, at its smallest and at the
+    /// size it starts with.
+    fn assert_fits(app: &mut App, what: &str) {
+        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+            let beyond: Vec<String> = lay_out(app, size)
+                .into_iter()
+                .filter(|shown| shown.right > size[0] + 0.5)
+                .map(|shown| shown.text)
+                .collect();
+            assert!(
+                beyond.is_empty(),
+                "{what}, in a window {} points wide, runs off the right edge: {beyond:?}",
+                size[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_for_a_printer_that_is_off_wraps_instead_of_running_off_the_window() {
+        let mut app = test_app();
+        failed_to_connect(&mut app);
+        let message = app.status.text.clone();
+        assert!(
+            message.starts_with("Could not connect: ") && message.len() > 150,
+            "the test needs the long error, but the status is {message:?}"
+        );
+
+        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+            let lines = lay_out(&mut app, size)
+                .into_iter()
+                .find(|shown| shown.text == message)
+                .map(|shown| shown.lines);
+            assert!(
+                lines.is_some_and(|lines| lines >= 2),
+                "in a window {} points wide the message should be wrapped onto several lines, \
+                 but it took {lines:?}",
+                size[0]
+            );
+        }
+        assert_fits(&mut app, "the error for a printer that is off");
+    }
+
+    #[test]
+    fn the_printer_row_fits_whichever_way_it_is_used() {
+        let mut app = test_app();
+        assert_fits(&mut app, "the window with a printer chosen");
+
+        app.connection = Connection::Connected(address(1));
+        assert_fits(&mut app, "the window when connected");
+
+        // The widest the row gets: an address typed by hand next to a connection that is up.
+        app.choice = Choice::Other;
+        app.manual_address = "AA:BB:CC:DD:EE:FF".to_string();
+        assert_fits(
+            &mut app,
+            "the window when connected, with an address typed in",
+        );
     }
 }
