@@ -13,8 +13,11 @@ use std::{
 use advmac::{MacAddr6, MacAddrFormat, ParseError};
 use clap::{Parser, Subcommand};
 use d30::bt;
+use d30::fonts::{FontSource, FontSpec, Fonts};
+use d30::render::{self, Align, Element, Label, TextElement};
+use d30::stock::{LabelStock, Media, STOCKS};
 use d30::D30Scale;
-use image::{DynamicImage, ImageError, ImageFormat};
+use image::{imageops, DynamicImage, ImageError, ImageFormat};
 use inquire::InquireError;
 use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
@@ -38,6 +41,10 @@ enum Commands {
     PrintText(ArgsPrintText),
     /// List the Bluetooth devices paired with this computer, to find the printer's address
     ListPrinters,
+    /// List the kinds of label and tape the printer can use
+    ListLabels,
+    /// List the fonts that labels can use
+    ListFonts,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -46,7 +53,34 @@ struct ArgsPrintText {
     dry_run: bool,
     #[arg(short, long)]
     device: Option<String>,
+    /// The text of the label. `\n` starts a new line
     text: String,
+    /// The label stock in the printer: a name from `list-labels`, or a size such as 12x35
+    #[arg(short, long, default_value = d30::stock::DEFAULT_STOCK_ID)]
+    label: String,
+    /// How long to make the label, in mm. Only for continuous (uncut) tape, where it is cut to fit
+    /// the text unless you say how long
+    #[arg(long)]
+    length: Option<f32>,
+    /// The font: the name of an installed font (see `list-fonts`) or the path of a font file
+    #[arg(short, long)]
+    font: Option<String>,
+    #[arg(long)]
+    bold: bool,
+    #[arg(long)]
+    italic: bool,
+    /// How the lines of text line up: left, center or right
+    #[arg(short, long, default_value = "center")]
+    align: Align,
+    /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by default
+    #[arg(long)]
+    media: Option<Media>,
+    /// Blank lines to feed after printing, e.g. to push uncut tape far enough out to tear off
+    #[arg(long)]
+    feed_lines: Option<usize>,
+    /// Also save the label as a picture at actual size (one pixel for each dot)
+    #[arg(long)]
+    save_image: Option<PathBuf>,
     #[arg(short, long)]
     #[arg(default_value = "auto")]
     scale: D30Scale,
@@ -218,7 +252,7 @@ fn cmd_show_preview(
 
     let path = preview_image_file
         .path()
-        .with_extension("jpg")
+        .with_extension("png")
         .into_os_string()
         .into_string()
         .unwrap();
@@ -351,6 +385,9 @@ enum CLIError {
     #[snafu(display("Binary unspecified"))]
     BinaryUnspecified,
 
+    #[snafu(display("{reason}"))]
+    BadOption { reason: String },
+
     #[snafu(display("Parent directory missing while performing task: {task}"))]
     ParentDirectoryMissing { task: String },
 }
@@ -376,9 +413,58 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             }
         }
     }
-    let image = d30::generate_image(&args_text, args.margins, args.scale).context(D30LibSnafu)?;
-    let mut preview_image = image.rotate90();
-    preview_image.invert();
+    let stock = LabelStock::parse(&args.label).map_err(|reason| CLIError::BadOption { reason })?;
+    let media = args.media.unwrap_or(stock.media);
+
+    let (mut font, fonts) = match args.font.as_deref() {
+        None => (FontSpec::default(), Fonts::embedded()),
+        Some(name_or_path) => {
+            let font = FontSpec::parse(name_or_path);
+            // Looking through the installed fonts takes a moment, so only do it when needed.
+            let fonts = match font.source {
+                FontSource::Family(_) => Fonts::system(),
+                _ => Fonts::embedded(),
+            };
+            (font, fonts)
+        }
+    };
+    font.bold = args.bold;
+    font.italic = args.italic;
+    if font.source == FontSource::Embedded && (args.bold || args.italic) {
+        warn!(
+            "The built-in font has no bold or italic. Pick a font with --font (see `list-fonts`)"
+        );
+    }
+
+    let mut text = TextElement::new(args_text);
+    text.font = font;
+    text.size = args.scale;
+    text.margin = args.margins;
+    text.align = args.align;
+    let mut label = Label::new(stock);
+    label.length_mm = args.length;
+    label.elements.push(Element::Text(text));
+
+    let rendered = render::render(&label, &fonts).context(D30LibSnafu)?;
+    let preview = rendered.preview();
+    if let Some(path) = &args.save_image {
+        preview.save(path).context(ImageSnafu {
+            task: "save the label picture",
+        })?;
+        println!("Saved the label picture to {}", path.display());
+    }
+    // The picture is only a few hundred dots wide, which is tiny on a screen: show every dot as a
+    // square of 4 by 4 pixels.
+    let preview_image = DynamicImage::ImageLuma8(imageops::resize(
+        &preview,
+        preview.width() * 4,
+        preview.height() * 4,
+        imageops::FilterType::Nearest,
+    ));
+    let raster = rendered
+        .raster()
+        .and_then(|raster| raster.with_blank_rows(args.feed_lines.unwrap_or(0)))
+        .context(D30LibSnafu)?;
     if show_preview {
         let should_accept = match cmd_show_preview(config.preview.clone(), preview_image)? {
             Accepted::Yes => true,
@@ -433,24 +519,21 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
 
     debug!("Init connection");
     if let Some(socket) = &mut socket {
-        socket.write_all(d30::INIT_BASE_FLAT).context(IOSnafu {
-            task: "send magic init bytes".to_string(),
-        })?;
+        socket
+            .write_all(&d30::protocol::init_sequence(media))
+            .context(IOSnafu {
+                task: "send magic init bytes".to_string(),
+            })?;
     }
     debug!("Extend output");
 
-    // Image must be send in chunks of 255 lines
-    let chunks = image.height() / 255;
+    // The picture has to be sent in chunks of 255 lines.
+    let writes = d30::protocol::image_writes(&raster);
     for image_num in 0..args.number_of_images {
-        let mut output = d30::IMG_PRECURSOR.to_vec();
-
-        for chunk_num in 0..=chunks {
-            let chunk = image.clone().crop(0, chunk_num * 255, image.width(), 255);
-            debug!("Extend output");
-            output.extend(d30::pack_image(&chunk));
+        for write in &writes {
             debug!("Write output to socket");
             if let Some(socket) = &mut socket {
-                socket.write_all(output.as_slice()).context(IOSnafu {
+                socket.write_all(write).context(IOSnafu {
                     task: format!("write image #{}", image_num),
                 })?;
             }
@@ -460,10 +543,32 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
                     task: "flush socket".to_string(),
                 })?;
             }
-            output.clear();
         }
     }
     Ok(())
+}
+
+fn cmd_list_labels() {
+    println!("{:<15} {:<34} TRIED ON A D30", "NAME", "KIND");
+    for stock in STOCKS {
+        println!(
+            "{:<15} {:<34} {}",
+            stock.id,
+            stock.name,
+            if stock.tested { "yes" } else { "no" }
+        );
+    }
+    println!(
+        "\nUse one with --label, e.g. `--label {}`. Any other size works too: `--label 12x35` for \
+         labels 12 mm wide and 35 mm long, or `--label 13-continuous` for uncut tape 13 mm wide.",
+        STOCKS[0].id
+    );
+}
+
+fn cmd_list_fonts() {
+    for family in Fonts::system().families() {
+        println!("{family}");
+    }
 }
 
 fn cmd_list_printers() -> Result<(), CLIError> {
@@ -526,6 +631,8 @@ async fn main() -> Result<(), CLIError> {
             cmd_print(&mut config, &args)?;
         }
         Commands::ListPrinters => cmd_list_printers()?,
+        Commands::ListLabels => cmd_list_labels(),
+        Commands::ListFonts => cmd_list_fonts(),
     }
 
     Ok(())
