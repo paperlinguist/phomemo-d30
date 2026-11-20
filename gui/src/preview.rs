@@ -27,8 +27,8 @@ struct Tile {
     width: u32,
 }
 
-/// The widest piece worth making, whatever the graphics card would take.
-const SMALLEST_LIMIT: usize = 256;
+/// The narrowest limit to go by. egui itself cannot work with a graphics card that takes less.
+const SMALLEST_LIMIT: usize = 1024;
 
 impl Preview {
     pub fn new(ctx: &egui::Context, rendered: Rendered, stock: LabelStock) -> Self {
@@ -163,9 +163,11 @@ mod tests {
     #[test]
     fn a_label_longer_than_the_graphics_card_takes_is_shown_in_pieces() {
         let ctx = egui::Context::default();
-        // Tell egui what the graphics card would take, the way eframe does when it starts.
+        // Tell egui what the graphics card would take, the way eframe does when it starts. (1024 is
+        // the least egui itself can work with.)
+        let limit = 1024;
         let input = egui::RawInput {
-            max_texture_side: Some(512),
+            max_texture_side: Some(limit),
             ..Default::default()
         };
         ctx.run_ui(input, |_| {}).drop_without_applying_deltas();
@@ -173,19 +175,19 @@ mod tests {
         let stock = d30::stock::LabelStock::parse("15-continuous").unwrap();
         let label = Label::text(
             stock.clone(),
-            "A very long text on uncut tape, far too long",
+            "A very long text on uncut tape, far too long. ".repeat(4),
         );
         let rendered = render(&label, &Fonts::embedded()).unwrap();
         let dots = rendered.length_dots();
         assert!(
-            dots > 3 * 512,
+            dots as usize > 3 * limit,
             "the test needs a long label, got {dots} dots"
         );
 
         let preview = Preview::new(&ctx, rendered, stock);
         assert!(preview.tiles.len() >= 4);
         for tile in &preview.tiles {
-            assert!(tile.texture.size()[0] <= 512, "a texture is too wide");
+            assert!(tile.texture.size()[0] <= limit, "a texture is too wide");
             assert_eq!(tile.texture.size()[1], 96);
         }
         let covered: u32 = preview.tiles.iter().map(|tile| tile.width).sum();
