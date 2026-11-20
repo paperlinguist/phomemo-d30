@@ -14,8 +14,11 @@ use snafu::{OptionExt, ResultExt, Snafu};
 // The Bluetooth link to the printer. It differs per platform (BlueZ on Linux, Winsock on Windows).
 #[cfg(all(feature = "bluetooth", any(target_os = "linux", windows)))]
 pub mod bt;
+#[cfg(all(feature = "bluetooth", any(target_os = "linux", windows)))]
+pub mod devices;
 
 pub mod fonts;
+pub mod printer;
 pub mod protocol;
 pub mod render;
 pub mod stock;
