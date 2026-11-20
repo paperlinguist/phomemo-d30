@@ -4,16 +4,22 @@ use std::{fs, io, path::PathBuf, str::FromStr};
 
 use d30::{
     fonts::{FontSource, FontSpec},
-    render::{Align, Element, Label, TextElement},
+    render::{Align, Element, Label, Lines, TextElement},
     stock::{LabelStock, DEFAULT_STOCK_ID},
     D30Scale,
 };
 use serde::{Deserialize, Serialize};
 
+/// The most lines a text can be split into, as far as what is remembered goes. The window offers
+/// fewer: a label this high has no room for more.
+const MOST_LINES: u32 = 8;
+
 /// Everything that can be changed about a label and how it is printed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LabelSettings {
     pub text: String,
+    /// Whether the lines break where the text does, or the program splits it over some lines.
+    pub lines: Lines,
     /// The name of a kind of label stock from `d30::stock::STOCKS`, e.g. `12x40`.
     pub stock_id: String,
     /// A size typed by hand, e.g. `12x35`. If it is not empty, it is used instead of `stock_id`.
@@ -40,6 +46,7 @@ impl Default for LabelSettings {
     fn default() -> Self {
         LabelSettings {
             text: "Hello".to_string(),
+            lines: Lines::AsTyped,
             stock_id: DEFAULT_STOCK_ID.to_string(),
             custom_stock: String::new(),
             fit_length: true,
@@ -88,6 +95,7 @@ impl LabelSettings {
         };
         text.align = self.align;
         text.margin = self.margin;
+        text.lines = self.lines;
 
         let mut label = Label::new(stock);
         if label.stock.is_continuous() && !self.fit_length {
@@ -115,6 +123,8 @@ pub struct Saved {
     /// The address of the printer that was used last, as `AA:BB:CC:DD:EE:FF`.
     pub printer: Option<String>,
     pub text: Option<String>,
+    /// How many lines the text is split into, or 0 for where it has new lines.
+    pub lines: Option<u32>,
     pub stock: Option<String>,
     pub custom_stock: Option<String>,
     pub font: Option<String>,
@@ -130,6 +140,10 @@ impl Saved {
         Saved {
             printer,
             text: Some(settings.text.clone()),
+            lines: Some(match settings.lines {
+                Lines::AsTyped => 0,
+                Lines::Split(count) => u32::try_from(count).unwrap_or(MOST_LINES),
+            }),
             stock: Some(settings.stock_id.clone()),
             custom_stock: Some(settings.custom_stock.clone()),
             font: settings.font.clone(),
@@ -146,6 +160,12 @@ impl Saved {
         let mut settings = LabelSettings::default();
         if let Some(text) = &self.text {
             settings.text = text.clone();
+        }
+        if let Some(lines) = self.lines {
+            settings.lines = match lines {
+                0 => Lines::AsTyped,
+                count => Lines::Split(count.min(MOST_LINES) as usize),
+            };
         }
         if let Some(stock) = &self.stock {
             settings.stock_id = stock.clone();
@@ -303,6 +323,7 @@ mod tests {
     fn what_is_remembered_survives_a_round_trip_through_toml() {
         let settings = LabelSettings {
             text: "Kitchen\nPantry".to_string(),
+            lines: Lines::Split(3),
             stock_id: "15-continuous".to_string(),
             font: Some("Comic Sans MS".to_string()),
             italic: true,
@@ -322,6 +343,28 @@ mod tests {
         assert!(restored.italic);
         assert_eq!(restored.align, Align::Left);
         assert_eq!(restored.copies, 3);
+        assert_eq!(restored.lines, Lines::Split(3));
+    }
+
+    #[test]
+    fn the_lines_setting_is_passed_on_to_the_text() {
+        let label = LabelSettings::default().label().unwrap();
+        assert_eq!(text_element(&label).lines, Lines::AsTyped);
+        let settings = LabelSettings {
+            lines: Lines::Split(2),
+            ..Default::default()
+        };
+        let label = settings.label().unwrap();
+        assert_eq!(text_element(&label).lines, Lines::Split(2));
+    }
+
+    #[test]
+    fn the_remembered_number_of_lines_makes_sense_whatever_the_file_says() {
+        let lines = |text: &str| toml::from_str::<Saved>(text).unwrap().settings().lines;
+        assert_eq!(lines(""), Lines::AsTyped);
+        assert_eq!(lines("lines = 0"), Lines::AsTyped);
+        assert_eq!(lines("lines = 2"), Lines::Split(2));
+        assert_eq!(lines("lines = 500"), Lines::Split(MOST_LINES as usize));
     }
 
     #[test]

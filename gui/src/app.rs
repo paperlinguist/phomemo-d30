@@ -15,7 +15,7 @@ use d30::{
     devices::{self, Device},
     fonts::Fonts,
     printer::{self, Command, Event, Job, Printer},
-    render::{self, Align},
+    render::{self, Align, Lines},
     stock::STOCKS,
 };
 use eframe::egui::{self, Color32, RichText};
@@ -35,6 +35,8 @@ pub struct Options {
     /// Save a picture of the window and close it.
     pub screenshot: Option<PathBuf>,
     pub text: Option<String>,
+    /// How many lines to split the text into; 0 for where it has new lines.
+    pub lines: Option<usize>,
     pub label: Option<String>,
     pub font: Option<String>,
 }
@@ -123,6 +125,12 @@ impl App {
         let mut settings = saved.settings();
         if let Some(text) = options.text {
             settings.text = text.replace("\\n", "\n");
+        }
+        if let Some(count) = options.lines {
+            settings.lines = match count {
+                0 => Lines::AsTyped,
+                count => Lines::Split(count),
+            };
         }
         if let Some(label) = options.label {
             settings.stock_id = label;
@@ -445,12 +453,35 @@ impl App {
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.heading("Text");
+        let typing_hint = match self.settings.lines {
+            Lines::AsTyped => "Type the label here. Enter starts a new line.",
+            Lines::Split(_) => "Type the label here. It is split into lines for you.",
+        };
         ui.add(
             egui::TextEdit::multiline(&mut self.settings.text)
-                .hint_text("Type the label here. Enter starts a new line.")
+                .hint_text(typing_hint)
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
         );
+        ui.horizontal(|ui| {
+            ui.label("Lines:");
+            ui.selectable_value(&mut self.settings.lines, Lines::AsTyped, "As typed")
+                .on_hover_text("A new line only where you press Enter");
+            for count in 1..=MOST_LINES_OFFERED {
+                ui.selectable_value(
+                    &mut self.settings.lines,
+                    Lines::Split(count),
+                    count.to_string(),
+                )
+                .on_hover_text(format!(
+                    "Split the text over {count} line{}, as evenly as the words allow",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+        });
+        if let Some(hint) = lines_hint(self.settings.lines, &self.settings.text) {
+            ui.label(RichText::new(hint).small().weak());
+        }
 
         ui.add_space(10.0);
         ui.heading("Font");
@@ -702,6 +733,29 @@ impl eframe::App for App {
     }
 }
 
+/// How many lines the window offers to split the text into. A label is 12 mm high, so more lines
+/// than this would hardly be readable.
+const MOST_LINES_OFFERED: usize = 3;
+
+/// What to tell the person about splitting the text, if there is something to say.
+fn lines_hint(lines: Lines, text: &str) -> Option<String> {
+    let Lines::Split(count) = lines else {
+        return None;
+    };
+    let words = text.split_whitespace().count();
+    if words == 0 {
+        None
+    } else if words < count {
+        // A word is never broken, so there are not as many lines as were asked for.
+        let plural = if words == 1 { "" } else { "s" };
+        Some(format!(
+            "Only {words} word{plural}, so just {words} line{plural}."
+        ))
+    } else {
+        Some("Split for you. New lines you type count as spaces.".to_string())
+    }
+}
+
 /// A number of blank rows that is either the default for the label stock or one the person set.
 fn optional_rows(ui: &mut egui::Ui, label: &str, value: &mut Option<usize>, default: usize) {
     ui.horizontal(|ui| {
@@ -766,6 +820,23 @@ mod tests {
 
     fn address(last_byte: u8) -> MacAddr6 {
         MacAddr6::new([2, 0, 0, 0, 0, last_byte])
+    }
+
+    #[test]
+    fn the_person_is_told_when_a_text_has_too_few_words_for_the_lines_asked_for() {
+        assert_eq!(lines_hint(Lines::AsTyped, "Kitchen pantry"), None);
+        assert_eq!(lines_hint(Lines::Split(2), "   "), None);
+        assert_eq!(
+            lines_hint(Lines::Split(2), "Hello").as_deref(),
+            Some("Only 1 word, so just 1 line.")
+        );
+        assert_eq!(
+            lines_hint(Lines::Split(3), "Hello\nthere").as_deref(),
+            Some("Only 2 words, so just 2 lines.")
+        );
+        assert!(lines_hint(Lines::Split(2), "Hello there you")
+            .unwrap()
+            .starts_with("Split for you"));
     }
 
     #[test]
