@@ -13,7 +13,7 @@ use advmac::{MacAddr6, MacAddrFormat, ParseError};
 use clap::{Parser, Subcommand};
 use d30::bt;
 use d30::fonts::{FontSource, FontSpec, Fonts};
-use d30::render::{self, Align, Element, Label, TextElement};
+use d30::render::{self, Align, Element, Label, Lines, TextElement};
 use d30::stock::{LabelStock, Media, STOCKS};
 use d30::D30Scale;
 use image::{imageops, DynamicImage, ImageError, ImageFormat};
@@ -71,6 +71,11 @@ struct ArgsPrintText {
     /// How the lines of text line up: left, center or right
     #[arg(short, long, default_value = "center")]
     align: Align,
+    /// Split the text over this many lines, as evenly as the words allow, instead of breaking it
+    /// only where it has a `\n` (which then counts as a space). A word is never broken, so a text
+    /// of two words has two lines at the most
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
+    lines: Option<u8>,
     /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by default
     #[arg(long)]
     media: Option<Media>,
@@ -447,6 +452,9 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     text.size = args.scale;
     text.margin = args.margins;
     text.align = args.align;
+    if let Some(lines) = args.lines {
+        text.lines = Lines::Split(usize::from(lines));
+    }
     let mut label = Label::new(stock);
     label.length_mm = args.length;
     label.elements.push(Element::Text(text));

@@ -96,11 +96,13 @@ d30-cli list-labels                                       # the labels and tape 
 d30-cli list-fonts                                        # the fonts you can pick
 d30-cli print-text "Hello" --label 14x50                  # another size of precut label
 d30-cli print-text 'Kitchen\nPantry' --font Arial --bold --align left
+d30-cli print-text "Kitchen pantry flour" --lines 2       # split the text over two lines for you
 d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to fit the text
 ```
 
 * `--label` takes a name from `list-labels`, or any size: `12x35` is a precut label 12 mm wide and 35 mm long, and `13-continuous` is uncut tape 13 mm wide. The D30 prints a band 12 mm wide, so on wider tape (up to 15 mm) the text is centred with a margin on each side.
 * `\n` in the text starts a new line, and `--align` lines the lines up left, center or right.
+* `--lines 2` (or 3, up to 8) splits the text over that many lines for you, with the breaks where the longest line comes out shortest, which lets the text be as large as possible. Line breaks you typed then count as spaces. A word is never broken, so a text of two words has two lines at the most.
 * `--font` takes the name of an installed font (capitals do not matter) or the path of a font file, and `--bold` and `--italic` pick that style of the font if it has one. Without `--font` the built-in DejaVu Sans is used.
 * `--save-image label.png` also saves the label as a picture, one pixel for each dot, which is exactly what gets printed. Together with `--dry-run` that works without a printer.
 
