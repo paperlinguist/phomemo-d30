@@ -62,7 +62,7 @@ The CLI runs natively on Windows 10 and 11. It talks to the printer through the 
 (Get-PnpDevice -Class Bluetooth -FriendlyName 'D30').InstanceId -replace '.*DEV_(..)(..)(..)(..)(..)(..).*','$1:$2:$3:$4:$5:$6'
 ```
 
-**3. Get the program.** Install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
+**3. Get the program.** Either download `d30-cli-windows-x86_64.zip` from the `nightly` release on this repository's Releases page and unzip it (it is rebuilt automatically whenever a pull request is merged), or build it yourself: install [Rust](https://rustup.rs) (its installer offers to set up the Visual Studio C++ build tools that it needs) and, from a checkout of this repository, run `cargo install --path cli`.
 
 **4. Print a label.**
 
