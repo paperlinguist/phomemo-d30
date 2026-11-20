@@ -1,0 +1,25 @@
+[package]
+name = "d30-gui"
+description = "A label designer for the Phomemo D30"
+# Keep in step with the other crates when bumping the version.
+version = "0.2.3"
+edition = "2021"
+repository = "https://github.com/crabdancing/phomemo-d30"
+license = "AGPL-3.0-or-later"
+keywords = ["driver", "hardware"]
+publish = false
+
+# A workspace of its own, with its own Cargo.lock. The egui version used here cannot share a
+# lockfile with the workspace in the parent directory: its show-image preview helper pins an old
+# wgpu that needs a web-sys feature that newer web-sys releases no longer have.
+[workspace]
+
+[dependencies]
+d30 = { path = "../d30" }
+advmac = "1.0.3"
+eframe = "0.37.0"
+env_logger = "0.11.1"
+image = { version = "0.24.6", default-features = false, features = ["png"] }
+log = "0.4.19"
+serde = { version = "1.0.178", features = ["derive"] }
+toml = "0.7.6"
