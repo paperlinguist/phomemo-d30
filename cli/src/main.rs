@@ -1,4 +1,3 @@
-// TODO: Figure out how to handle non-precut labels
 // TODO: Figure out how to handle 'fruit' labels
 // TODO: Implement templates with fixed font sizes and positions
 // TODO: Implement 'arbitrary image' feature
@@ -38,7 +37,7 @@ struct Arguments {
 #[derive(Debug, Subcommand)]
 enum Commands {
     #[clap(short_flag = 't')]
-    PrintText(ArgsPrintText),
+    PrintText(Box<ArgsPrintText>),
     /// List the Bluetooth devices paired with this computer, to find the printer's address
     ListPrinters,
     /// List the kinds of label and tape the printer can use
@@ -75,7 +74,14 @@ struct ArgsPrintText {
     /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by default
     #[arg(long)]
     media: Option<Media>,
-    /// Blank lines to feed after printing, e.g. to push uncut tape far enough out to tear off
+    /// Blank lines to print before the label. The first lines a printer prints can come out
+    /// squashed together while the tape gets moving. Uncut tape gets 30 by default (about 4 mm),
+    /// precut labels none
+    #[arg(long)]
+    lead_in_lines: Option<usize>,
+    /// Blank lines to feed after printing, to push the label far enough out of the printer to tear
+    /// it off with its text in the middle. Uncut tape gets 134 by default (about 17 mm), precut
+    /// labels none
     #[arg(long)]
     feed_lines: Option<usize>,
     /// Also save the label as a picture at actual size (one pixel for each dot)
@@ -463,7 +469,18 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     ));
     let raster = rendered
         .raster()
-        .and_then(|raster| raster.with_blank_rows(args.feed_lines.unwrap_or(0)))
+        .and_then(|raster| {
+            raster.with_lead_rows(
+                args.lead_in_lines
+                    .unwrap_or_else(|| label.stock.default_lead_rows()),
+            )
+        })
+        .and_then(|raster| {
+            raster.with_blank_rows(
+                args.feed_lines
+                    .unwrap_or_else(|| label.stock.default_feed_rows()),
+            )
+        })
         .context(D30LibSnafu)?;
     if show_preview {
         let should_accept = match cmd_show_preview(config.preview.clone(), preview_image)? {
