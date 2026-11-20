@@ -96,16 +96,41 @@ const fn precut(
     }
 }
 
-const fn continuous(id: &'static str, name: &'static str, width_mm: f32) -> LabelStock {
+const fn continuous(
+    id: &'static str,
+    name: &'static str,
+    width_mm: f32,
+    tested: bool,
+) -> LabelStock {
     LabelStock {
         id: Cow::Borrowed(id),
         name: Cow::Borrowed(name),
         width_mm,
         length_mm: None,
         media: Media::Continuous,
-        tested: false,
+        tested,
     }
 }
+
+/// How many blank rows to print in front of a label on uncut tape.
+///
+/// The first rows a printer prints can come out squashed together while the tape gets moving. On a
+/// D30 the last `e` and the `!` of a label ran into each other with 15 blank dots in front of them,
+/// and came out clear of each other with 45. A label has a margin of 15 dots of its own, so this
+/// adds the other 30.
+pub const CONTINUOUS_LEAD_ROWS: usize = 30;
+
+/// How many blank rows to feed after a label on uncut tape, so that the label comes far enough out
+/// of the printer to be torn off with its text in the middle.
+///
+/// The print head sits about 7 mm (roughly 55 rows) behind the tear edge, so the label's last dots
+/// are still inside the printer when it has been printed. Torn off at the edge, the blank tape on
+/// the end side of the text is then its margin, the lead-in and those 7 mm, and the start side
+/// only gets what is fed beyond the 7 mm. Feeding twice the 7 mm plus the lead-in would even them
+/// out (140 rows). Measured on a D30 with 15 mm tape: 72 rows left about 4 mm on the start side
+/// against 9 to 10 mm on the end side, and 4 mm more (32 rows) looked right, which with the
+/// default margin and lead-in comes to 134.
+pub const CONTINUOUS_FEED_ROWS: usize = 134;
 
 /// The label stock Phomemo lists for the D30 (and the sizes from other D30 drivers).
 ///
@@ -118,9 +143,19 @@ pub static STOCKS: &[LabelStock] = &[
     precut("14x28", "14 × 28 mm precut labels", 14.0, 28.0, false),
     precut("14x50", "14 × 50 mm precut labels", 14.0, 50.0, false),
     precut("15x50", "15 × 50 mm precut labels", 15.0, 50.0, false),
-    continuous("12-continuous", "12 mm continuous (uncut) tape", 12.0),
-    continuous("14-continuous", "14 mm continuous (uncut) tape", 14.0),
-    continuous("15-continuous", "15 mm continuous (uncut) tape", 15.0),
+    continuous(
+        "12-continuous",
+        "12 mm continuous (uncut) tape",
+        12.0,
+        false,
+    ),
+    continuous(
+        "14-continuous",
+        "14 mm continuous (uncut) tape",
+        14.0,
+        false,
+    ),
+    continuous("15-continuous", "15 mm continuous (uncut) tape", 15.0, true),
 ];
 
 /// What `--label` defaults to: the 12 × 40 mm precut labels.
@@ -139,6 +174,26 @@ impl LabelStock {
     /// The length of one label in dots, or `None` for continuous tape.
     pub fn length_dots(&self) -> Option<u32> {
         self.length_mm.map(mm_to_dots)
+    }
+
+    /// The blank rows to print before a label of this stock: none for precut labels, and
+    /// [`CONTINUOUS_LEAD_ROWS`] for uncut tape.
+    pub fn default_lead_rows(&self) -> usize {
+        if self.is_continuous() {
+            CONTINUOUS_LEAD_ROWS
+        } else {
+            0
+        }
+    }
+
+    /// The blank rows to feed after printing a label of this stock: none for precut labels, which
+    /// the printer positions itself, and [`CONTINUOUS_FEED_ROWS`] for uncut tape.
+    pub fn default_feed_rows(&self) -> usize {
+        if self.is_continuous() {
+            CONTINUOUS_FEED_ROWS
+        } else {
+            0
+        }
     }
 
     /// How much tape is left on each side of the print head when the tape is wider than 12 mm.
@@ -324,6 +379,32 @@ mod tests {
         assert_eq!(LabelStock::parse("12x40").unwrap().side_margin_mm(), 0.0);
         assert_eq!(LabelStock::parse("14x30").unwrap().side_margin_mm(), 1.0);
         assert_eq!(LabelStock::parse("15x50").unwrap().side_margin_mm(), 1.5);
+    }
+
+    #[test]
+    fn uncut_tape_gets_a_lead_in_and_a_feed_and_precut_labels_get_neither() {
+        for id in ["12x40", "14x50"] {
+            let stock = LabelStock::parse(id).unwrap();
+            assert_eq!(stock.default_lead_rows(), 0, "{id}");
+            assert_eq!(stock.default_feed_rows(), 0, "{id}");
+        }
+        for id in ["12-continuous", "15-continuous", "13-continuous"] {
+            let stock = LabelStock::parse(id).unwrap();
+            assert_eq!(stock.default_lead_rows(), CONTINUOUS_LEAD_ROWS, "{id}");
+            assert_eq!(stock.default_feed_rows(), CONTINUOUS_FEED_ROWS, "{id}");
+        }
+        // The head is about 7 mm (56 rows) behind the tear edge; the feed has to clear that.
+        assert!(CONTINUOUS_FEED_ROWS as f32 > 7.0 * DOTS_PER_MM);
+    }
+
+    #[test]
+    fn only_what_has_been_tried_on_a_printer_is_marked_as_tested() {
+        let tested: Vec<_> = STOCKS
+            .iter()
+            .filter(|stock| stock.tested)
+            .map(|stock| stock.id.to_string())
+            .collect();
+        assert_eq!(tested, ["12x40", "15-continuous"]);
     }
 
     #[test]

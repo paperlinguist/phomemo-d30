@@ -78,6 +78,24 @@ impl Raster {
         &self.data
     }
 
+    /// Adds `extra` blank rows before the picture, so that they are printed first.
+    ///
+    /// The first rows the printer prints can come out squashed together while the tape gets moving.
+    /// Blank rows in front take that, and the picture starts once the tape is moving evenly.
+    pub fn with_lead_rows(mut self, extra: usize) -> Result<Raster, D30Error> {
+        let rows = self.rows + extra;
+        if rows > MAX_ROWS {
+            return Err(too_big_or_empty(&format!(
+                "the label with its lead-in is {rows} dots long, but the printer takes at most {MAX_ROWS}"
+            )));
+        }
+        let mut data = vec![0u8; self.width_bytes * extra];
+        data.append(&mut self.data);
+        self.data = data;
+        self.rows = rows;
+        Ok(self)
+    }
+
     /// Adds `extra` blank rows after the picture. The printer feeds them like any other row, which
     /// is how uncut tape is pushed far enough out of the printer to be torn off.
     pub fn with_blank_rows(mut self, extra: usize) -> Result<Raster, D30Error> {
@@ -233,10 +251,33 @@ mod tests {
     }
 
     #[test]
+    fn lead_rows_are_printed_first_and_the_picture_follows_unchanged() {
+        let plain = Raster::from_gray(&picture(96, 100)).unwrap();
+        let led = plain.clone().with_lead_rows(30).unwrap();
+        assert_eq!(led.rows(), 130);
+        assert_eq!(led.bytes().len(), 130 * 12);
+        assert!(led.bytes()[..30 * 12].iter().all(|byte| *byte == 0));
+        assert_eq!(&led.bytes()[30 * 12..], plain.bytes());
+        assert_eq!(&image_header(&led)[12..], &[130, 0]);
+    }
+
+    #[test]
+    fn lead_rows_and_feed_rows_can_be_combined() {
+        let raster = Raster::from_gray(&picture(96, 100))
+            .unwrap()
+            .with_lead_rows(30)
+            .unwrap()
+            .with_blank_rows(134)
+            .unwrap();
+        assert_eq!(raster.rows(), 100 + 30 + 134);
+    }
+
+    #[test]
     fn pictures_the_printer_cannot_take_are_rejected() {
         assert!(Raster::from_gray(&GrayImage::new(96, 0)).is_err());
         assert!(Raster::from_gray(&GrayImage::new(96, MAX_ROWS as u32 + 1)).is_err());
         let raster = Raster::from_gray(&GrayImage::new(96, MAX_ROWS as u32)).unwrap();
-        assert!(raster.with_blank_rows(1).is_err());
+        assert!(raster.clone().with_blank_rows(1).is_err());
+        assert!(raster.with_lead_rows(1).is_err());
     }
 }
