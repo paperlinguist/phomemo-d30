@@ -1,0 +1,108 @@
+name: Windows build and release
+
+on:
+  # Merging a pull request is a push to master: build, test and publish the "nightly" release.
+  push:
+    branches: [master]
+  # Pull requests only build and test, so a broken Windows build is caught before it is merged.
+  pull_request:
+  # Allows running it by hand from the Actions tab (it only publishes when run on master).
+  workflow_dispatch:
+
+concurrency:
+  # Builds of master run one after another, so the newest merge always ends up as the published
+  # release. A newer push to a pull request cancels that pull request's older, now pointless run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # Link the C runtime into the exe, so that it runs on a fresh Windows without the
+      # "Visual C++ Redistributable" installed.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Rust (with the MSVC toolchain) comes preinstalled on the runner image.
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p d30 -p d30-cli
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p d30-cli
+
+      - name: Smoke test the executable
+        run: ./target/x86_64-pc-windows-msvc/release/d30-cli.exe --version
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = 'd30-cli-windows-x86_64'
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/d30-cli.exe, README.md, LICENSE -Destination "dist/$name"
+          # Windows' own bsdtar writes a normal zip (forward slashes, one top-level folder). The
+          # PowerShell zip commands do not reliably do that. The full path avoids GNU tar from Git,
+          # which cannot write zip files.
+          & "$env:SystemRoot\System32\tar.exe" -a -c -f "dist/$name.zip" -C dist $name
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          # A single line with a plain LF ending, so that `sha256sum -c` also works on Linux and macOS.
+          "$hash  $name.zip`n" | Set-Content -Path "dist/$name.zip.sha256" -Encoding ascii -NoNewline
+
+      # Pull requests get the package too, so a reviewer can try the build before merging.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-package
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish the nightly release
+    needs: build
+    # Only builds of master are published, never pull requests or other branches.
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Needed to create the release and its tag. Nothing from the repository is checked out or
+      # built in this job; it only handles the finished package from the build job.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-package
+          path: dist
+
+      # "nightly" is a single rolling release: each merge deletes the previous one and publishes the
+      # new build in its place, so it always holds the latest master.
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          Windows (x64) build of the master branch at commit ${GITHUB_SHA::7}, rebuilt automatically whenever a pull request is merged.
+
+          Unzip it and run d30-cli.exe from a terminal. The README explains how to pair the printer and find its address.
+          The .sha256 file holds the checksum of the zip.
+          EOF
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release delete nightly --cleanup-tag --yes
+          fi
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Windows build (latest master)" \
+            --notes-file notes.md
