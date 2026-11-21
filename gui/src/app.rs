@@ -22,6 +22,7 @@ use d30::{
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
+    emoji::{self, Emoji},
     preview::Preview,
     settings::{LabelSettings, PictureSettings, Saved},
 };
@@ -45,6 +46,8 @@ pub struct Options {
     pub picture_side: Option<Side>,
     pub picture_dither: bool,
     pub picture_invert: bool,
+    /// Open the emoji picker.
+    pub emoji: bool,
 }
 
 /// Which printer is chosen.
@@ -73,6 +76,95 @@ enum Level {
 struct Status {
     level: Level,
     text: String,
+}
+
+/// The emoji picker: what is typed in its search, which group it shows, and which emoji the fonts
+/// can draw.
+#[derive(Default)]
+struct EmojiPicker {
+    query: String,
+    group: usize,
+    /// For each group, the emoji of it that can be drawn. Found when the picker is first shown,
+    /// because that can mean reading a large font.
+    drawable: Option<Vec<Vec<Emoji>>>,
+    /// The search box is to be given the keyboard as soon as it is there.
+    focus_search: bool,
+    /// The picker is to open on its own, which is for trying things out.
+    open_now: bool,
+}
+
+impl EmojiPicker {
+    /// Shows the picker, and returns the emoji that was clicked on, if one was.
+    fn show(&mut self, ui: &mut egui::Ui, fonts: &Fonts) -> Option<char> {
+        let Self {
+            query,
+            group,
+            drawable,
+            focus_search,
+            open_now: _,
+        } = self;
+        let drawable = drawable.get_or_insert_with(|| {
+            emoji::GROUPS
+                .iter()
+                .map(|group| {
+                    group
+                        .emoji()
+                        .filter(|emoji| fonts.fallback_draws(emoji.symbol))
+                        .collect()
+                })
+                .collect()
+        });
+
+        ui.set_width(330.0);
+        let search = ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text("Search: carrot, home, heart…")
+                .desired_width(f32::INFINITY),
+        );
+        if std::mem::take(focus_search) {
+            search.request_focus();
+        }
+        let searching = !query.trim().is_empty();
+        if !searching {
+            ui.horizontal_wrapped(|ui| {
+                for (index, shown) in emoji::GROUPS.iter().enumerate() {
+                    ui.selectable_value(group, index, shown.icon.to_string())
+                        .on_hover_text(shown.name);
+                }
+            });
+            ui.label(RichText::new(emoji::GROUPS[*group].name).small().weak());
+        }
+        let shown: Vec<Emoji> = if searching {
+            emoji::search(query)
+                .into_iter()
+                .filter(|emoji| fonts.fallback_draws(emoji.symbol))
+                .collect()
+        } else {
+            drawable[(*group).min(drawable.len() - 1)].clone()
+        };
+
+        let mut chosen = None;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                if shown.is_empty() {
+                    ui.label("Nothing like that.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for emoji in &shown {
+                        let button =
+                            egui::Button::new(RichText::new(emoji.symbol.to_string()).size(22.0))
+                                .min_size(egui::vec2(34.0, 34.0))
+                                .frame(false);
+                        if ui.add(button).on_hover_text(emoji.name).clicked() {
+                            chosen = Some(emoji.symbol);
+                        }
+                    }
+                });
+            });
+        chosen
+    }
 }
 
 pub struct App {
@@ -104,6 +196,8 @@ pub struct App {
     /// which has the window to put it in front of.
     pick_picture: bool,
 
+    emoji: EmojiPicker,
+
     screenshot: Option<PathBuf>,
     screenshot_taken: Arc<AtomicBool>,
     frames: u32,
@@ -115,13 +209,9 @@ impl App {
         let printer = Printer::start(printer::Bluetooth, printer::CONNECT_ATTEMPTS, move || {
             context.request_repaint()
         });
-        Self::assemble(
-            Saved::load(),
-            devices::discover(),
-            Fonts::system(),
-            printer,
-            options,
-        )
+        let fonts = Fonts::system();
+        install_emoji_font(&cc.egui_ctx, &fonts);
+        Self::assemble(Saved::load(), devices::discover(), fonts, printer, options)
     }
 
     /// Puts the window together from what the outside world has provided: what was remembered, the
@@ -182,6 +272,10 @@ impl App {
             previewed: None,
             picture_error: None,
             pick_picture: false,
+            emoji: EmojiPicker {
+                open_now: options.emoji,
+                ..Default::default()
+            },
             screenshot: options.screenshot,
             screenshot_taken: Arc::new(AtomicBool::new(false)),
             frames: 0,
@@ -503,13 +597,20 @@ impl App {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        ui.heading("Text");
+        let text_id = egui::Id::unique("label text");
+        ui.horizontal(|ui| {
+            ui.heading("Text");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.emoji_button(ui, text_id);
+            });
+        });
         let typing_hint = match self.settings.lines {
             Lines::AsTyped => "Type the label here. Enter starts a new line.",
             Lines::Split(_) => "Type the label here. It is split into lines for you.",
         };
         ui.add(
             egui::TextEdit::multiline(&mut self.settings.text)
+                .id(text_id)
                 .hint_text(typing_hint)
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
@@ -757,6 +858,51 @@ impl App {
 }
 
 impl App {
+    /// The button that opens the emoji picker, and the picker when it is open. An emoji that is
+    /// clicked goes into the text where the cursor was, and the picker stays open for the next.
+    fn emoji_button(&mut self, ui: &mut egui::Ui, text_id: egui::Id) {
+        let button = ui
+            .button("😀 Emoji")
+            .on_hover_text("Put an emoji in the text");
+        if button.clicked() {
+            self.emoji.focus_search = true;
+        }
+        let mut chosen = None;
+        let open_now = std::mem::take(&mut self.emoji.open_now);
+        egui::Popup::from_toggle_button_response(&button)
+            .open_memory(if button.clicked() {
+                Some(egui::SetOpenCommand::Toggle)
+            } else if open_now {
+                Some(egui::SetOpenCommand::Bool(true))
+            } else {
+                None
+            })
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| chosen = self.emoji.show(ui, &self.fonts));
+        if let Some(symbol) = chosen {
+            self.insert_into_text(ui.ctx(), text_id, symbol);
+        }
+    }
+
+    /// Puts `symbol` into the text where the cursor of the text box was (in place of what was
+    /// selected), or at the end if the cursor was never there, puts the cursor after it, and gives
+    /// the keyboard back to the text box.
+    fn insert_into_text(&mut self, ctx: &egui::Context, text_id: egui::Id, symbol: char) {
+        let mut state = egui::TextEdit::load_state(ctx, text_id).unwrap_or_default();
+        let selected = state.cursor.char_range().map(|range| {
+            let [start, end] = range.sorted_cursors();
+            (start.index.0, end.index.0)
+        });
+        let cursor = insert_at_cursor(&mut self.settings.text, selected, &symbol.to_string());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(cursor),
+            )));
+        state.store(ctx, text_id);
+        ctx.memory_mut(|memory| memory.request_focus(text_id));
+    }
+
     /// The picture on the label: choosing it, and how it is turned into dots.
     fn picture_section(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
@@ -925,6 +1071,49 @@ fn lines_hint(lines: Lines, text: &str) -> Option<String> {
     } else {
         Some("Split for you. New lines you type count as spaces.".to_string())
     }
+}
+
+/// Puts `text` into `target` from character `selected.0` to character `selected.1` (the selection
+/// of a text box, which is where the cursor is when they are the same), or at the end if there is
+/// no cursor. Returns the character the cursor goes to: right after what was put in.
+fn insert_at_cursor(target: &mut String, selected: Option<(usize, usize)>, text: &str) -> usize {
+    let count = target.chars().count();
+    let (start, end) = selected.map_or((count, count), |(start, end)| {
+        (start.min(count), end.min(count))
+    });
+    let byte = |character: usize| {
+        target
+            .char_indices()
+            .nth(character)
+            .map_or(target.len(), |(byte, _)| byte)
+    };
+    let (from, to) = (byte(start), byte(end));
+    target.replace_range(from..to, text);
+    start + text.chars().count()
+}
+
+/// Lets the window draw the emoji that the labels do: the installed emoji font (Windows has a
+/// recent one) after the fonts the window has. Without it the window's own, older emoji font would
+/// show a box for the newer emoji, in the text box and in the picker, though the label has them.
+fn install_emoji_font(ctx: &egui::Context, fonts: &Fonts) {
+    let Some((bytes, index)) = fonts.installed_emoji_font() else {
+        return;
+    };
+    let mut data = egui::FontData::from_owned(bytes);
+    data.index = index;
+    let mut definitions = egui::FontDefinitions::default();
+    definitions
+        .font_data
+        .insert("installed-emoji".to_string(), Arc::new(data));
+    if let Some(proportional) = definitions
+        .families
+        .get_mut(&egui::FontFamily::Proportional)
+    {
+        // After the first font, which has the letters and digits, and before the others, so that
+        // an emoji is drawn the way the label draws it.
+        proportional.insert(1.min(proportional.len()), "installed-emoji".to_string());
+    }
+    ctx.set_fonts(definitions);
 }
 
 /// A number of blank rows that is either the default for the label stock or one the person set.
@@ -1429,5 +1618,143 @@ mod tests {
         let app = assemble(saved);
         assert!(app.settings.picture.is_none());
         assert!(app.picture_error.is_some());
+    }
+
+    // ---- emoji ------------------------------------------------------------------------------
+
+    #[test]
+    fn an_emoji_goes_where_the_cursor_is_or_in_place_of_what_is_selected() {
+        let put = |text: &str, selected: Option<(usize, usize)>| {
+            let mut text = text.to_string();
+            let cursor = insert_at_cursor(&mut text, selected, "🍎");
+            (text, cursor)
+        };
+        let result = |text: &str, cursor: usize| (text.to_string(), cursor);
+        assert_eq!(put("Hello world", Some((5, 5))), result("Hello🍎 world", 6));
+        assert_eq!(put("Hello world", Some((0, 0))), result("🍎Hello world", 1));
+        // What was selected makes way for it.
+        assert_eq!(put("Hello world", Some((6, 11))), result("Hello 🍎", 7));
+        // Without a cursor, at the end.
+        assert_eq!(put("Hello", None), result("Hello🍎", 6));
+        assert_eq!(put("", None), result("🍎", 1));
+        // A cursor that is past the end is at the end.
+        assert_eq!(put("Hi", Some((50, 60))), result("Hi🍎", 3));
+        // Places are characters, not bytes.
+        assert_eq!(put("é🍌x", Some((2, 2))), result("é🍌🍎x", 3));
+    }
+
+    #[test]
+    fn choosing_an_emoji_puts_it_in_the_text_box_at_its_cursor_and_the_cursor_after_it() {
+        let context = egui::Context::default();
+        let id = egui::Id::unique("label text");
+        let mut app = test_app();
+        app.settings.text = "Hello world".to_string();
+        let mut state = egui::TextEdit::load_state(&context, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(5),
+            )));
+        state.store(&context, id);
+
+        app.insert_into_text(&context, id, '🍎');
+        assert_eq!(app.settings.text, "Hello🍎 world");
+        let range = egui::TextEdit::load_state(&context, id)
+            .and_then(|state| state.cursor.char_range())
+            .expect("the cursor is kept");
+        assert_eq!(
+            (range.primary.index.0, range.secondary.index.0),
+            (6, 6),
+            "the cursor is right after the emoji"
+        );
+        // So the next one comes after the first.
+        app.insert_into_text(&context, id, '🥕');
+        assert_eq!(app.settings.text, "Hello🍎🥕 world");
+
+        // A text box that nobody has put the cursor in takes it at the end.
+        let mut fresh = test_app();
+        fresh.settings.text = "Pantry".to_string();
+        fresh.insert_into_text(&egui::Context::default(), id, '🫙');
+        assert_eq!(fresh.settings.text, "Pantry🫙");
+    }
+
+    /// The emoji of the list that are drawn as buttons in what `lay_out` returned.
+    fn emoji_buttons(shown: &[Shown]) -> Vec<char> {
+        shown
+            .iter()
+            .filter_map(|text| {
+                let mut characters = text.text.chars();
+                let symbol = characters.next()?;
+                characters.next().is_none().then_some(symbol)
+            })
+            .filter(|symbol| {
+                emoji::GROUPS
+                    .iter()
+                    .any(|group| group.emoji().any(|emoji| emoji.symbol == *symbol))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_emoji_picker_opens_and_offers_emoji_and_the_search_narrows_them_down() {
+        let mut app = test_app();
+        assert!(
+            emoji_buttons(&lay_out(&mut app, WINDOW_SIZE)).is_empty(),
+            "the picker is closed to begin with"
+        );
+
+        app.emoji.open_now = true;
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.len() > 50, "{} emoji offered", offered.len());
+        assert!(offered.contains(&'🍎'));
+        assert!(!offered.contains(&'🐶'), "only the first group is shown");
+
+        // Another group.
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        app.emoji.group = 3;
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.contains(&'🐶') && !offered.contains(&'🍎'));
+
+        // A search looks through all of them.
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        app.emoji.query = "apple".to_string();
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.contains(&'🍎') && offered.contains(&'🍏'));
+        assert!(offered.len() < 6, "{offered:?}");
+
+        app.emoji.query = "zzzzzz".to_string();
+        app.emoji.open_now = true;
+        let shown = lay_out(&mut app, WINDOW_SIZE);
+        assert!(emoji_buttons(&shown).is_empty());
+        assert!(shown.iter().any(|text| text.text == "Nothing like that."));
+    }
+
+    #[test]
+    fn the_open_emoji_picker_fits_the_smallest_window() {
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        assert_fits(&mut app, "the window with the emoji picker open");
+    }
+
+    #[test]
+    fn an_emoji_in_the_text_is_on_the_label() {
+        let mut app = test_app();
+        app.settings.text = "🍎".to_string();
+        lay_out(&mut app, WINDOW_SIZE);
+        let Some(Ok(preview)) = &app.preview else {
+            panic!("the label should have been drawn");
+        };
+        let ink = preview
+            .rendered
+            .canvas()
+            .pixels()
+            .filter(|pixel| pixel[0] > 127)
+            .count();
+        assert!(
+            ink > 300,
+            "an apple is a big shape, but there are {ink} dots"
+        );
     }
 }

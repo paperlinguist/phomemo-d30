@@ -599,6 +599,17 @@ mod tests {
     }
 
     #[test]
+    fn a_text_with_emoji_survives_being_saved() {
+        let settings = LabelSettings {
+            text: "🍎 Apples\n🥕 Carrots ☕".to_string(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&Saved::new(&settings, None)).unwrap();
+        let saved: Saved = toml::from_str(&text).unwrap();
+        assert_eq!(saved.settings().text, settings.text);
+    }
+
+    #[test]
     fn the_lines_setting_is_passed_on_to_the_text() {
         let label = LabelSettings::default().label().unwrap();
         assert_eq!(text_element(&label).lines, Lines::AsTyped);

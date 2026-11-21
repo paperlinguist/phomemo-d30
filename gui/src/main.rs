@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod emoji;
 mod preview;
 mod settings;
 
@@ -39,6 +40,7 @@ fn main() -> eframe::Result {
 /// The options for trying things out: `--screenshot FILE` saves a picture of the window and closes
 /// it, and `--text`, `--lines`, `--label` and `--font` start with those chosen. So does
 /// `--picture FILE`, with `--picture-side left|right`, `--picture-dither` and `--picture-invert`.
+/// `--emoji` opens the emoji picker.
 fn options_from_args() -> Options {
     let mut options = Options::default();
     let mut args = std::env::args().skip(1);
@@ -53,6 +55,7 @@ fn options_from_args() -> Options {
             }
             "--picture-dither" => options.picture_dither = true,
             "--picture-invert" => options.picture_invert = true,
+            "--emoji" => options.emoji = true,
             "--label" => options.label = args.next(),
             "--font" => options.font = args.next(),
             other => eprintln!("Ignoring the unknown option {other}"),
