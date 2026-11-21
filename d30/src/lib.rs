@@ -18,6 +18,7 @@ pub mod bt;
 pub mod devices;
 
 pub mod fonts;
+pub mod picture;
 pub mod printer;
 pub mod protocol;
 pub mod render;
@@ -171,6 +172,13 @@ pub enum D30Error {
     CouldNotReadFontFile { path: PathBuf, source: io::Error },
     #[snafu(display("Invalid label: {reason}"))]
     InvalidLabel { reason: String },
+    #[snafu(display("Could not read the picture {}: {source}", path.display()))]
+    CouldNotReadPicture {
+        path: PathBuf,
+        source: image::ImageError,
+    },
+    #[snafu(display("Unusable picture: {reason}"))]
+    InvalidPicture { reason: String },
 
     #[snafu(display("Failed to serialize TOML D30 config"))]
     CouldNotParse { source: toml::de::Error },

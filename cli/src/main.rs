@@ -13,8 +13,9 @@ use advmac::{MacAddr6, MacAddrFormat, ParseError};
 use clap::{Parser, Subcommand};
 use d30::bt;
 use d30::fonts::{FontSource, FontSpec, Fonts};
-use d30::render::{self, Align, Element, Label, Lines, TextElement};
-use d30::stock::{LabelStock, Media, STOCKS};
+use d30::picture::{Picture, Tone};
+use d30::render::{self, Align, Element, Label, Lines, PictureElement, Side, TextElement};
+use d30::stock::{LabelStock, Media, DOTS_PER_MM, STOCKS};
 use d30::D30Scale;
 use image::{imageops, DynamicImage, ImageError, ImageFormat};
 use inquire::InquireError;
@@ -76,6 +77,27 @@ struct ArgsPrintText {
     /// of two words has two lines at the most
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=8))]
     lines: Option<u8>,
+    /// A picture to put on the label beside the text: a PNG, JPEG, GIF, BMP, ICO, TIFF or WebP
+    /// file. With an empty text ("") the picture is on its own, in the middle
+    #[arg(long)]
+    picture: Option<PathBuf>,
+    /// Which end of the label the picture is at: left or right
+    #[arg(long, default_value = "left")]
+    picture_side: Side,
+    /// Make the grays of the picture dots in patterns, which suits photographs, instead of black
+    /// and white, which suits drawings, logos and writing
+    #[arg(long)]
+    picture_dither: bool,
+    /// Where gray turns black, from 0 (nothing does) to 255 (everything but white does). Not for a
+    /// dithered picture
+    #[arg(long, default_value = "128")]
+    picture_level: u8,
+    /// Swap black and white in the picture
+    #[arg(long)]
+    picture_invert: bool,
+    /// How high the picture is, in mm. As high as the label allows (less the margins) by default
+    #[arg(long)]
+    picture_height: Option<f32>,
     /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by default
     #[arg(long)]
     media: Option<Media>,
@@ -458,6 +480,19 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     let mut label = Label::new(stock);
     label.length_mm = args.length;
     label.elements.push(Element::Text(text));
+    if let Some(path) = &args.picture {
+        let mut picture = PictureElement::new(Picture::open(path).context(D30LibSnafu)?);
+        picture.side = args.picture_side;
+        picture.tone = if args.picture_dither {
+            Tone::Dither
+        } else {
+            Tone::Threshold(args.picture_level)
+        };
+        picture.invert = args.picture_invert;
+        picture.height = args.picture_height.map(|mm| mm * DOTS_PER_MM);
+        picture.margin = args.margins;
+        label.elements.push(Element::Picture(picture));
+    }
 
     let rendered = render::render(&label, &fonts).context(D30LibSnafu)?;
     let preview = rendered.preview();
