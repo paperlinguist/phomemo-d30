@@ -81,11 +81,13 @@ The label preview (`--preview`) opens the image in Windows' default image viewer
 `d30-gui` is a window for making labels without the command line:
 
 * **Printer** (top): pick the printer from the Bluetooth devices your computer has paired (plus any printers named in the command line program's config file), then press **Connect**. The connection stays open, so printing starts at once; **Disconnect** frees the printer for other programs. **Pair…** opens Windows' Bluetooth settings, and **Refresh** looks again for paired printers. On Linux the list of paired devices is not available yet, so type the printer's address under "Other address…".
-* **Settings** (left): the text (Enter starts a new line), the font with bold and italic, the size or "as large as fits", alignment, margin, and the kind of label or tape. For uncut tape you can cut the label to fit the text or give a length.
+* **Settings** (left): the text, the font with bold and italic, the size or "as large as fits", alignment, margin, a picture, and the kind of label or tape. For uncut tape you can cut the label to fit the text or give a length.
+  * **Lines**: "As typed" breaks the text only where you press Enter. Choosing 1, 2 or 3 makes the program split the text over that many lines for you, with the breaks where the longest line is shortest, so that the text can be as large as possible. A long text on uncut tape gets much shorter that way.
+  * **Picture**: press "Choose a picture…" or drop a picture file on the window (PNG, JPEG, GIF, BMP, ICO, TIFF or WebP). It goes beside the text, at the left or the right end of the label, as high as the label allows (or as high as you say), and the text is made as large as fits what is left. Without any text the picture is centered. Choose "Black and white" for drawings, logos and writing (the slider says where gray turns black) or "Photo" for patterns of dots that follow the grays, and "Swap black and white" for a light picture on a dark background. Transparent parts of a picture are white.
 * **Preview** (middle): the label exactly as it will print, one square for each dot.
 * **Print** (bottom): how many copies, and the print button. Connecting and printing happen in the background, so the window never freezes while the printer is slow to answer.
 
-Your last printer, text and settings are remembered next time.
+Your last printer, text, picture and settings are remembered next time.
 
 ## Labels, fonts and uncut tape
 
