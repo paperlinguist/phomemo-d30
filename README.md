@@ -120,6 +120,8 @@ d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to f
 * The print head sits about 7 mm behind the edge you tear the tape on, so the end of a label is still inside the printer when it has been printed. The program feeds some blank tape after the label (`--feed-lines`, 134 by default) so that you can tear it off with its text in the middle.
 * The first rows a printer prints can come out squashed together while the tape gets moving. The program prints some blank tape before the label (`--lead-in-lines`, 30 by default) to take that.
 
+**Labels with a wide gap.** The 12 × 40 mm labels come out of the printer far enough to cut or peel by themselves. The 14 × 30 mm labels have a gap of 8 mm between them, and printed without anything fed after them they stop short of the cutting line (the tear edge is about 7 mm beyond the print head). So the program feeds 64 rows after each of them, 8 mm, the length of the gap, which puts the cutting line somewhere in the gap. If it is not in the middle, change it (8 rows are 1 mm): `--feed-lines` on the command line, or "After the label" under "Tape handling" in the window. For the other sizes the gap is not known, so nothing is fed after them.
+
 **What has been tried.** Only the 12 × 40 mm precut labels and 15 mm uncut tape have been tried on a real D30. The other sizes come from Phomemo's own listings and from other D30 drivers, so they should work, but `list-labels` marks them as not tried. Tape narrower than 12 mm is not supported, because the print head is 12 mm wide. Labels shaped for fruit are not supported yet.
 
 ## Configuration (imperative)

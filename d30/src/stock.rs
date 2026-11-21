@@ -75,6 +75,9 @@ pub struct LabelStock {
     /// The length of one label, or `None` for continuous tape.
     pub length_mm: Option<f32>,
     pub media: Media,
+    /// The gap between two labels on the roll, in mm, where it is known. The printer does not leave
+    /// every kind of label far enough out to cut between two of them, and this is what to feed.
+    pub gap_mm: Option<f32>,
     /// Whether this has been tried on a real printer.
     pub tested: bool,
 }
@@ -84,6 +87,7 @@ const fn precut(
     name: &'static str,
     width_mm: f32,
     length_mm: f32,
+    gap_mm: Option<f32>,
     tested: bool,
 ) -> LabelStock {
     LabelStock {
@@ -92,6 +96,7 @@ const fn precut(
         width_mm,
         length_mm: Some(length_mm),
         media: Media::Gap,
+        gap_mm,
         tested,
     }
 }
@@ -108,9 +113,14 @@ const fn continuous(
         width_mm,
         length_mm: None,
         media: Media::Continuous,
+        gap_mm: None,
         tested,
     }
 }
+
+/// How far the tear edge of the printer is beyond the print head, in mm: measured on a D30 as about
+/// 7 mm (roughly 55 rows).
+pub const HEAD_TO_TEAR_MM: f32 = 7.0;
 
 /// How many blank rows to print in front of a label on uncut tape.
 ///
@@ -136,13 +146,21 @@ pub const CONTINUOUS_FEED_ROWS: usize = 134;
 ///
 /// Anything else can be given as `WIDTHxLENGTH`, for example `12x35`, or `WIDTH-continuous`.
 pub static STOCKS: &[LabelStock] = &[
-    precut("12x40", "12 × 40 mm precut labels", 12.0, 40.0, true),
-    precut("12x30", "12 × 30 mm precut labels", 12.0, 30.0, false),
-    precut("14x40", "14 × 40 mm precut labels", 14.0, 40.0, false),
-    precut("14x30", "14 × 30 mm precut labels", 14.0, 30.0, false),
-    precut("14x28", "14 × 28 mm precut labels", 14.0, 28.0, false),
-    precut("14x50", "14 × 50 mm precut labels", 14.0, 50.0, false),
-    precut("15x50", "15 × 50 mm precut labels", 15.0, 50.0, false),
+    precut("12x40", "12 × 40 mm precut labels", 12.0, 40.0, None, true),
+    precut("12x30", "12 × 30 mm precut labels", 12.0, 30.0, None, false),
+    precut("14x40", "14 × 40 mm precut labels", 14.0, 40.0, None, false),
+    // The gap is 8 mm on the labels it was tried with.
+    precut(
+        "14x30",
+        "14 × 30 mm precut labels",
+        14.0,
+        30.0,
+        Some(8.0),
+        false,
+    ),
+    precut("14x28", "14 × 28 mm precut labels", 14.0, 28.0, None, false),
+    precut("14x50", "14 × 50 mm precut labels", 14.0, 50.0, None, false),
+    precut("15x50", "15 × 50 mm precut labels", 15.0, 50.0, None, false),
     continuous(
         "12-continuous",
         "12 mm continuous (uncut) tape",
@@ -186,13 +204,24 @@ impl LabelStock {
         }
     }
 
-    /// The blank rows to feed after printing a label of this stock: none for precut labels, which
-    /// the printer positions itself, and [`CONTINUOUS_FEED_ROWS`] for uncut tape.
+    /// The blank rows to feed after printing a label of this stock: [`CONTINUOUS_FEED_ROWS`] for uncut
+    /// tape, and for precut labels none (the printer positions the 12 × 40 mm labels itself) unless the
+    /// gap between the labels is known, which is then fed: see [`LabelStock::gap_mm`].
+    ///
+    /// The tear edge is [`HEAD_TO_TEAR_MM`] beyond the print head, so unless the printer feeds the
+    /// label out by itself, the end of a label is still inside the printer when it has been printed,
+    /// and the gap that follows it is behind that. To cut between two labels the edge has to be in the
+    /// gap: it is at the end of the label after that much feed, and at the start of the next label
+    /// after that much plus the length of the gap. Feeding the length of the gap on top of what the
+    /// printer feeds by itself, which has to be less than that much (or the label would already come
+    /// out far enough), puts the edge in the gap, so long as the gap is at least that long. With the
+    /// 8 mm gap of the 14 × 30 mm labels this is 64 rows. It can be set from the command line
+    /// (`--feed-lines`) and in the window.
     pub fn default_feed_rows(&self) -> usize {
         if self.is_continuous() {
             CONTINUOUS_FEED_ROWS
         } else {
-            0
+            self.gap_mm.map_or(0, |gap| mm_to_dots(gap) as usize)
         }
     }
 
@@ -229,6 +258,7 @@ impl LabelStock {
                     width_mm: width,
                     length_mm: Some(length),
                     media: Media::Gap,
+                    gap_mm: None,
                     tested: false,
                 });
             }
@@ -246,6 +276,7 @@ impl LabelStock {
                     width_mm: width,
                     length_mm: None,
                     media: Media::Continuous,
+                    gap_mm: None,
                     tested: false,
                 });
             }
@@ -395,6 +426,28 @@ mod tests {
         }
         // The head is about 7 mm (56 rows) behind the tear edge; the feed has to clear that.
         assert!(CONTINUOUS_FEED_ROWS as f32 > 7.0 * DOTS_PER_MM);
+    }
+
+    #[test]
+    fn labels_with_a_known_gap_are_fed_that_far_so_that_the_tear_edge_is_in_it() {
+        let stock = LabelStock::parse("14x30").unwrap();
+        assert_eq!(stock.gap_mm, Some(8.0));
+        // 8 mm at 8 dots to the millimetre.
+        assert_eq!(stock.default_feed_rows(), 64);
+        assert_eq!(stock.default_lead_rows(), 0);
+
+        // What makes that work: the gap is at least as long as the way from the head to the edge.
+        for stock in STOCKS.iter().filter(|stock| stock.gap_mm.is_some()) {
+            let gap = stock.gap_mm.unwrap();
+            assert!(gap >= HEAD_TO_TEAR_MM, "{}: a gap of {gap} mm", stock.id);
+        }
+
+        // Where the gap is not known, nothing is fed: the 12 x 40 mm labels come out far enough
+        // by themselves, and a size that is typed in could be anything.
+        assert_eq!(LabelStock::parse("12x40").unwrap().default_feed_rows(), 0);
+        let typed = LabelStock::parse("14x31").unwrap();
+        assert_eq!(typed.gap_mm, None);
+        assert_eq!(typed.default_feed_rows(), 0);
     }
 
     #[test]
