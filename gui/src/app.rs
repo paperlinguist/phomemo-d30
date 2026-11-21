@@ -14,15 +14,16 @@ use d30::{
     bt,
     devices::{self, Device},
     fonts::Fonts,
+    picture::Picture,
     printer::{self, Command, Event, Job, Printer},
-    render::{self, Align, Lines},
+    render::{self, Align, Lines, Side},
     stock::STOCKS,
 };
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     preview::Preview,
-    settings::{LabelSettings, Saved},
+    settings::{LabelSettings, PictureSettings, Saved},
 };
 
 /// How big the window starts out, and the smallest it can be made, in points.
@@ -39,6 +40,11 @@ pub struct Options {
     pub lines: Option<usize>,
     pub label: Option<String>,
     pub font: Option<String>,
+    /// A picture file to put on the label, and how: at which end, dithered, swapped.
+    pub picture: Option<PathBuf>,
+    pub picture_side: Option<Side>,
+    pub picture_dither: bool,
+    pub picture_invert: bool,
 }
 
 /// Which printer is chosen.
@@ -91,6 +97,12 @@ pub struct App {
     /// The label as drawn for `previewed`, or why it could not be drawn.
     preview: Option<Result<Preview, String>>,
     previewed: Option<LabelSettings>,
+
+    /// Why the picture could not be read, if that is so.
+    picture_error: Option<String>,
+    /// The person has asked to choose a picture file. The dialog is opened by [`eframe::App::ui`],
+    /// which has the window to put it in front of.
+    pick_picture: bool,
 
     screenshot: Option<PathBuf>,
     screenshot_taken: Arc<AtomicBool>,
@@ -146,7 +158,7 @@ impl App {
         let (choice, manual_address) =
             initial_choice(&discovery.devices, saved_address, discovery.default_address);
 
-        App {
+        let mut app = App {
             settings,
             fonts,
             devices: discovery.devices,
@@ -168,9 +180,48 @@ impl App {
             help: None,
             preview: None,
             previewed: None,
+            picture_error: None,
+            pick_picture: false,
             screenshot: options.screenshot,
             screenshot_taken: Arc::new(AtomicBool::new(false)),
             frames: 0,
+        };
+
+        // The picture on the label: the one that the command line names, or else the one that was
+        // on it last time (if its file can still be read).
+        if let Some(path) = options.picture {
+            app.load_picture(path);
+            if let Some(picture) = &mut app.settings.picture {
+                picture.side = options.picture_side.unwrap_or(picture.side);
+                picture.dither = options.picture_dither;
+                picture.invert = options.picture_invert;
+            }
+        } else if let Some(remembered) = &saved.picture {
+            if let Some(path) = remembered.path() {
+                match Picture::open(&path) {
+                    Ok(picture) => app.settings.picture = Some(remembered.settings(path, picture)),
+                    Err(error) => app.picture_error = Some(error.to_string()),
+                }
+            }
+        }
+        app
+    }
+
+    /// Puts the picture in this file on the label, or says why it cannot.
+    fn load_picture(&mut self, path: PathBuf) {
+        match Picture::open(&path) {
+            Ok(picture) => {
+                self.picture_error = None;
+                match &mut self.settings.picture {
+                    // Another picture takes the place of the one there is, set in the same way.
+                    Some(current) => {
+                        current.path = path;
+                        current.picture = picture;
+                    }
+                    None => self.settings.picture = Some(PictureSettings::new(path, picture)),
+                }
+            }
+            Err(error) => self.picture_error = Some(error.to_string()),
         }
     }
 
@@ -532,6 +583,8 @@ impl App {
         });
         ui.add(egui::Slider::new(&mut self.settings.margin, 0.0..=60.0).text("margin (dots)"));
 
+        self.picture_section(ui);
+
         ui.add_space(10.0);
         ui.heading("Label");
         let preset_text = STOCKS
@@ -704,8 +757,82 @@ impl App {
 }
 
 impl App {
+    /// The picture on the label: choosing it, and how it is turned into dots.
+    fn picture_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.heading("Picture");
+        ui.horizontal(|ui| {
+            if ui.button("Choose a picture…").clicked() {
+                self.pick_picture = true;
+            }
+            if self.settings.picture.is_some() && ui.button("Remove").clicked() {
+                self.settings.picture = None;
+                self.picture_error = None;
+            }
+        });
+        if let Some(error) = &self.picture_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let Some(picture) = &mut self.settings.picture else {
+            ui.label(
+                RichText::new("Or drop a picture file on the window.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        };
+
+        let name = picture
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ui.label(
+            RichText::new(format!(
+                "{name}  ({} × {} pixels)",
+                picture.picture.width(),
+                picture.picture.height()
+            ))
+            .small()
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Side:");
+            ui.selectable_value(&mut picture.side, Side::Left, "Left");
+            ui.selectable_value(&mut picture.side, Side::Right, "Right");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Dots:");
+            ui.selectable_value(&mut picture.dither, false, "Black and white")
+                .on_hover_text("For drawings, logos and writing");
+            ui.selectable_value(&mut picture.dither, true, "Photo")
+                .on_hover_text("Patterns of dots that follow the grays, for photographs");
+        });
+        if !picture.dither {
+            ui.add(egui::Slider::new(&mut picture.level, 1..=254).text("black below"))
+                .on_hover_text("Parts of the picture darker than this are black");
+        }
+        ui.checkbox(&mut picture.invert, "Swap black and white");
+        ui.checkbox(&mut picture.fit_height, "As high as the label allows");
+        if !picture.fit_height {
+            ui.add(egui::Slider::new(&mut picture.height, 8.0..=96.0).text("height (dots)"));
+        }
+    }
+
     /// The whole window, once.
     fn show(&mut self, ui: &mut egui::Ui) {
+        // A picture file dropped on the window goes on the label.
+        let dropped = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .first()
+                .map(|file| file.path().to_path_buf())
+        });
+        if let Some(path) = dropped {
+            self.load_picture(path);
+        }
+
         self.handle_printer_events();
         self.update_preview(ui.ctx());
 
@@ -719,13 +846,54 @@ impl App {
             });
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui));
 
+        show_what_is_being_dropped(ui.ctx());
         self.handle_screenshot(ui);
     }
 }
 
+/// While a file is held over the window, covers it with what is going to happen if it is let go.
+fn show_what_is_being_dropped(ctx: &egui::Context) {
+    if ctx.input(|input| input.raw.hovered_files.is_empty()) {
+        return;
+    }
+    let layer = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("file_drop_target"),
+    );
+    let painter = ctx.layer_painter(layer);
+    let area = ctx.content_rect();
+    painter.rect_filled(area, 0.0, Color32::from_black_alpha(180));
+    painter.text(
+        area.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop the picture here",
+        egui::TextStyle::Heading.resolve(&ctx.global_style()),
+        Color32::WHITE,
+    );
+}
+
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.show(ui);
+
+        // The dialog is opened here and not in `show`, because it needs the window to be put in
+        // front of. The program waits for it, which is what a person choosing a file expects.
+        if std::mem::take(&mut self.pick_picture) {
+            let picked = rfd::FileDialog::new()
+                .set_title("Choose a picture for the label")
+                .add_filter(
+                    "Pictures",
+                    &[
+                        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp",
+                    ],
+                )
+                .add_filter("All files", &["*"])
+                .set_parent(&*frame)
+                .pick_file();
+            if let Some(path) = picked {
+                self.load_picture(path);
+            }
+        }
     }
 
     fn on_exit(&mut self) {
@@ -1015,5 +1183,222 @@ mod tests {
             &mut app,
             "the window when connected, with an address typed in",
         );
+    }
+
+    // ---- pictures ---------------------------------------------------------------------------
+
+    /// A folder of its own for the files a test makes, removed when it is dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("d30-gui-test-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        /// A PNG, black all over, `size` dots square.
+        fn black_picture(&self, name: &str, size: u32) -> PathBuf {
+            let path = self.0.join(name);
+            image::RgbaImage::from_pixel(size, size, image::Rgba([0, 0, 0, 255]))
+                .save(&path)
+                .unwrap();
+            path
+        }
+
+        fn broken_file(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"this is not a picture").unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file as egui hands it over when it is dropped on the window.
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn a_picture_dropped_on_the_window_goes_on_the_label() {
+        let dir = TempDir::new("dropped");
+        let path = dir.black_picture("jar.png", 20);
+        let mut app = test_app();
+        assert!(app.settings.picture.is_none());
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]),
+            )),
+            dropped_files: vec![Arc::new(Dropped(path.clone())) as egui::DroppedFileHandle],
+            ..Default::default()
+        };
+        context
+            .run_ui(input, |ui| app.show(ui))
+            .drop_without_applying_deltas();
+
+        let picture = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture is on the label");
+        assert_eq!(picture.path, path);
+        assert_eq!(
+            (picture.picture.width(), picture.picture.height()),
+            (20, 20)
+        );
+        assert!(app.picture_error.is_none());
+        // And the preview shows it: 66 dots square, from column 15 on a 12x40 label.
+        let Some(Ok(preview)) = &app.preview else {
+            panic!("the label should have been drawn");
+        };
+        let canvas = preview.rendered.canvas();
+        assert!(canvas.get_pixel(40, 48)[0] > 127);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_picture_is_reported_and_the_label_is_left_alone() {
+        let dir = TempDir::new("broken");
+        let mut app = test_app();
+        app.load_picture(dir.broken_file("notes.png"));
+        assert!(app.settings.picture.is_none());
+        let error = app.picture_error.clone().expect("there is an error");
+        assert!(error.contains("notes.png"), "{error}");
+
+        // A picture that can be read clears the error.
+        app.load_picture(dir.black_picture("jar.png", 8));
+        assert!(app.settings.picture.is_some());
+        assert!(app.picture_error.is_none());
+
+        // And one that cannot be read does not take the picture away.
+        app.load_picture(dir.0.join("missing.png"));
+        assert!(app.settings.picture.is_some());
+        assert!(app.picture_error.is_some());
+    }
+
+    #[test]
+    fn another_picture_is_set_in_the_same_way_as_the_one_it_replaces() {
+        let dir = TempDir::new("replace");
+        let mut app = test_app();
+        app.load_picture(dir.black_picture("first.png", 8));
+        let first = app.settings.picture.clone().unwrap();
+        {
+            let picture = app.settings.picture.as_mut().unwrap();
+            picture.side = Side::Right;
+            picture.dither = true;
+            picture.invert = true;
+        }
+        app.load_picture(dir.black_picture("second.png", 12));
+        let second = app.settings.picture.as_ref().unwrap();
+        assert!(second.path.ends_with("second.png"));
+        assert_ne!(second.picture, first.picture);
+        assert_eq!((second.picture.width(), second.picture.height()), (12, 12));
+        assert_eq!(
+            (second.side, second.dither, second.invert),
+            (Side::Right, true, true)
+        );
+    }
+
+    #[test]
+    fn the_picture_settings_fit_the_smallest_window() {
+        let dir = TempDir::new("fits");
+        let mut app = test_app();
+        // A name that is long, as the names of files can be, and an error of a good length.
+        app.load_picture(dir.black_picture(
+            "a picture with a really quite long name for a file that holds a small jar.png",
+            16,
+        ));
+        assert_fits(&mut app, "the window with a picture");
+        app.settings.picture.as_mut().unwrap().fit_height = false;
+        assert_fits(&mut app, "the window with a picture of a chosen height");
+        app.picture_error = Some(
+            "Could not read the picture C:\\Users\\somebody\\Pictures\\a folder with a long name\\jar.png: \
+             the file is not a picture that this program can read"
+                .to_string(),
+        );
+        assert_fits(&mut app, "the window with an error about the picture");
+    }
+
+    #[test]
+    fn the_picture_command_line_options_load_it_and_set_it() {
+        let dir = TempDir::new("options");
+        let path = dir.black_picture("jar.png", 8);
+        let options = Options {
+            picture: Some(path.clone()),
+            picture_side: Some(Side::Right),
+            picture_dither: true,
+            picture_invert: true,
+            ..Default::default()
+        };
+        let app = App::assemble(
+            Saved::default(),
+            devices::Discovery::default(),
+            Fonts::embedded(),
+            Printer::start(Unreachable, 1, || {}),
+            options,
+        );
+        let picture = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture is loaded");
+        assert_eq!(picture.path, path);
+        assert_eq!(
+            (picture.side, picture.dither, picture.invert),
+            (Side::Right, true, true)
+        );
+    }
+
+    #[test]
+    fn the_picture_from_last_time_comes_back_if_its_file_is_still_there() {
+        let dir = TempDir::new("remembered");
+        let path = dir.black_picture("jar.png", 8);
+        let mut settings = LabelSettings::default();
+        let mut picture = PictureSettings::new(path.clone(), Picture::open(&path).unwrap());
+        picture.side = Side::Right;
+        picture.level = 99;
+        settings.picture = Some(picture);
+        let saved = Saved::new(&settings, None);
+
+        let assemble = |saved: Saved| {
+            App::assemble(
+                saved,
+                devices::Discovery::default(),
+                Fonts::embedded(),
+                Printer::start(Unreachable, 1, || {}),
+                Options::default(),
+            )
+        };
+        let app = assemble(saved.clone());
+        let back = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture comes back");
+        assert_eq!((back.side, back.level), (Side::Right, 99));
+        assert!(app.picture_error.is_none());
+
+        // Once the file is gone there is no picture, and the person is told why.
+        std::fs::remove_file(&path).unwrap();
+        let app = assemble(saved);
+        assert!(app.settings.picture.is_none());
+        assert!(app.picture_error.is_some());
     }
 }
