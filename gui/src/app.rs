@@ -1706,7 +1706,9 @@ mod tests {
         app.emoji.open_now = true;
         let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
         assert!(offered.len() > 50, "{} emoji offered", offered.len());
-        assert!(offered.contains(&'🍎'));
+        // (The buttons of the groups show an emoji each too, the apple for food and drink, so
+        // the emoji to look for are ones that are not those.)
+        assert!(offered.contains(&'🍌'));
         assert!(!offered.contains(&'🐶'), "only the first group is shown");
 
         // Another group.
@@ -1714,9 +1716,9 @@ mod tests {
         app.emoji.open_now = true;
         app.emoji.group = 3;
         let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
-        assert!(offered.contains(&'🐶') && !offered.contains(&'🍎'));
+        assert!(offered.contains(&'🐶') && !offered.contains(&'🍌'));
 
-        // A search looks through all of them.
+        // A search looks through all of them, and the buttons of the groups are out of the way.
         let mut app = test_app();
         app.emoji.open_now = true;
         app.emoji.query = "apple".to_string();
