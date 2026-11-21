@@ -99,6 +99,7 @@ d30-cli list-fonts                                        # the fonts you can pi
 d30-cli print-text "Hello" --label 14x50                  # another size of precut label
 d30-cli print-text 'Kitchen\nPantry' --font Arial --bold --align left
 d30-cli print-text "Kitchen pantry flour" --lines 2       # split the text over two lines for you
+d30-cli print-text "🍎 Apples"                              # emoji work too
 d30-cli print-text "Pantry" --picture jar.png             # a picture beside the text
 d30-cli print-text "" --picture photo.jpg --picture-dither   # a picture on its own, as patterns of dots
 d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to fit the text
@@ -107,6 +108,7 @@ d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to f
 * `--label` takes a name from `list-labels`, or any size: `12x35` is a precut label 12 mm wide and 35 mm long, and `13-continuous` is uncut tape 13 mm wide. The D30 prints a band 12 mm wide, so on wider tape (up to 15 mm) the text is centred with a margin on each side.
 * `\n` in the text starts a new line, and `--align` lines the lines up left, center or right.
 * `--lines 2` (or 3, up to 8) splits the text over that many lines for you, with the breaks where the longest line comes out shortest, which lets the text be as large as possible. Line breaks you typed then count as spaces. A word is never broken, so a text of two words has two lines at the most.
+* Emoji can be part of the text. When the font has no glyph for a character, an emoji font draws it, in black and white, which is how a label printer prints it. On Windows that is Segoe UI Emoji, which has all the current emoji; where it is missing, a small font built into the library draws the older ones. Skin tones and the characters that only choose the emoji form are left out, and emoji made of several (families, flags) come out as their parts.
 * `--picture FILE` puts a picture (PNG, JPEG, GIF, BMP, ICO, TIFF or WebP) at the left end of the label, or at the right with `--picture-side right`. It is as high as the label allows (less the margins), keeps its shape, and the text gets the room that is left. With an empty text (`""`) the picture is on its own, in the middle. On a label of a set length the pictures together take at most 60% of it, so that the text always has some room; uncut tape that is cut to fit just gets longer.
 * Colors become grays, and transparent parts are white, so a logo with a transparent background prints as the logo and not as a black square. Then the grays become dots: by default black where the picture is darker than half (`--picture-level` from 0 to 255 moves that), which suits drawings, logos and writing; `--picture-dither` makes patterns of dots instead, which suits photographs. `--picture-invert` swaps black and white (for a white logo on a dark background), and `--picture-height 6` makes the picture 6 mm high.
 * `--font` takes the name of an installed font (capitals do not matter) or the path of a font file, and `--bold` and `--italic` pick that style of the font if it has one. Without `--font` the built-in DejaVu Sans is used.

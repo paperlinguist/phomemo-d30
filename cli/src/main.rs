@@ -449,13 +449,23 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     let stock = LabelStock::parse(&args.label).map_err(|reason| CLIError::BadOption { reason })?;
     let media = args.media.unwrap_or(stock.media);
 
+    // Looking through the installed fonts takes a moment, so only do it when needed: for a font
+    // that is chosen by its name, and for text that may have emoji, which an installed font draws.
+    let may_have_emoji = !args_text.is_ascii();
     let (mut font, fonts) = match args.font.as_deref() {
-        None => (FontSpec::default(), Fonts::embedded()),
+        None => (
+            FontSpec::default(),
+            if may_have_emoji {
+                Fonts::system()
+            } else {
+                Fonts::embedded()
+            },
+        ),
         Some(name_or_path) => {
             let font = FontSpec::parse(name_or_path);
-            // Looking through the installed fonts takes a moment, so only do it when needed.
             let fonts = match font.source {
                 FontSource::Family(_) => Fonts::system(),
+                _ if may_have_emoji => Fonts::system(),
                 _ => Fonts::embedded(),
             };
             (font, fonts)

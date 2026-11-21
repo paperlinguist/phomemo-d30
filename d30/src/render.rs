@@ -11,7 +11,7 @@ use imageproc::drawing::{draw_text_mut, text_size};
 use rusttype::{point, Font, Scale};
 
 use crate::{
-    fonts::{FontSpec, Fonts},
+    fonts::{has_glyph, FontSpec, Fonts},
     picture::{Picture, Tone},
     protocol::{Raster, MAX_ROWS},
     stock::{mm_to_dots, LabelStock, PRINT_WIDTH_DOTS},
@@ -437,9 +437,135 @@ fn invalid(reason: String) -> D30Error {
 /// its lines. It is big, so that the rounding of the sizes of glyphs hardly matters.
 const MEASURING_SIZE: f32 = 100.0;
 
+/// The font of a block of text, and the fonts that draw what it has no glyph for (emoji, mostly).
+///
+/// A line is cut into runs, each in the font that has its glyphs, set one after the other with
+/// their baselines level. A line that the font of the label can draw all by itself is one run in
+/// that font, which comes out exactly as if there were no other fonts.
+#[derive(Clone)]
+struct Face {
+    primary: Font<'static>,
+    fallbacks: Vec<Font<'static>>,
+}
+
+impl Face {
+    /// The face to draw `text` with. The fallback fonts only come along if a character needs one.
+    fn new(primary: Font<'static>, fonts: &Fonts, text: &str) -> Face {
+        let fallbacks = if text.chars().any(|c| !has_glyph(&primary, c)) {
+            fonts.fallbacks().to_vec()
+        } else {
+            Vec::new()
+        };
+        Face { primary, fallbacks }
+    }
+
+    /// 0 for the font of the label, or 1 and up for a fallback: whichever draws `c`. Where none does,
+    /// the font of the label, which draws the box that fonts draw for what they lack.
+    fn font_index(&self, c: char) -> usize {
+        if has_glyph(&self.primary, c) {
+            return 0;
+        }
+        self.fallbacks
+            .iter()
+            .position(|font| has_glyph(font, c))
+            .map_or(0, |position| position + 1)
+    }
+
+    fn font(&self, index: usize) -> &Font<'static> {
+        match index {
+            0 => &self.primary,
+            _ => &self.fallbacks[index - 1],
+        }
+    }
+
+    /// The text cut into runs: which font, and the part of the text.
+    fn runs<'t>(&self, text: &'t str) -> Vec<(usize, &'t str)> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        let mut current = None;
+        for (position, c) in text.char_indices() {
+            let index = self.font_index(c);
+            match current {
+                Some(font) if font == index => {}
+                Some(font) => {
+                    runs.push((font, &text[start..position]));
+                    start = position;
+                    current = Some(index);
+                }
+                None => current = Some(index),
+            }
+        }
+        if let Some(font) = current {
+            runs.push((font, &text[start..]));
+        }
+        runs
+    }
+
+    fn v_metrics(&self, scale: Scale) -> rusttype::VMetrics {
+        self.primary.v_metrics(scale)
+    }
+
+    /// How far down a run in this font is set, so that its baseline is the line's.
+    fn drop(&self, font: &Font<'static>, scale: Scale) -> i32 {
+        (self.primary.v_metrics(scale).ascent - font.v_metrics(scale).ascent).round() as i32
+    }
+
+    /// The width and height of the ink of a line.
+    fn text_size(&self, scale: Scale, text: &str) -> (i32, i32) {
+        if self.fallbacks.is_empty() {
+            return text_size(scale, &self.primary, text);
+        }
+        let (mut pen, mut width, mut height) = (0.0_f32, 0, 0);
+        for (index, run) in self.runs(text) {
+            let font = self.font(index);
+            let (run_width, run_height) = text_size(scale, font, run);
+            width = width.max((pen + run_width as f32).ceil() as i32);
+            height = height.max(self.drop(font, scale) + run_height);
+            pen += advance(font, scale, run);
+        }
+        (width, height)
+    }
+
+    /// How far the pen moves while the line is set: where the next glyph would start.
+    fn advance(&self, scale: Scale, text: &str) -> f32 {
+        if self.fallbacks.is_empty() {
+            return advance(&self.primary, scale, text);
+        }
+        self.runs(text)
+            .into_iter()
+            .map(|(index, run)| advance(self.font(index), scale, run))
+            .sum()
+    }
+
+    /// Draws a line with the top of its first line at `y`, starting at `x`.
+    fn draw(&self, canvas: &mut GrayImage, x: i32, y: i32, scale: Scale, text: &str) {
+        if self.fallbacks.is_empty() {
+            draw_text_mut(canvas, Luma([255u8]), x, y, scale, &self.primary, text);
+            return;
+        }
+        let mut pen = 0.0_f32;
+        for (index, run) in self.runs(text) {
+            let font = self.font(index);
+            let at = (x + pen.round() as i32, y + self.drop(font, scale));
+            draw_text_mut(canvas, Luma([255u8]), at.0, at.1, scale, font, run);
+            pen += advance(font, scale, run);
+        }
+    }
+}
+
+/// Characters that only say how to show the one before them, and have nothing to show of their
+/// own: the selectors that ask for the emoji or the text form, the joiner of emoji that make a
+/// family, the skin tones, and the tags of flags. Fonts draw boxes for them, and they are left out.
+fn is_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200d}' | '\u{fe0e}' | '\u{fe0f}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
 /// A block of text with its font and size decided and measured.
 struct Block {
-    font: Font<'static>,
+    face: Face,
     scale: Scale,
     lines: Vec<String>,
     line_widths: Vec<i32>,
@@ -455,16 +581,17 @@ fn lay_out(
     box_width: Option<f32>,
     box_height: f32,
 ) -> Result<Block, D30Error> {
-    let font = fonts.load(&element.font)?;
+    let text: String = element.text.chars().filter(|&c| !is_ignorable(c)).collect();
+    let face = Face::new(fonts.load(&element.font)?, fonts, &text);
     let lines = match element.lines {
-        Lines::AsTyped => typed_lines(&element.text),
-        Lines::Split(count) => split_into_lines(&font, &element.text, count),
+        Lines::AsTyped => typed_lines(&text),
+        Lines::Split(count) => split_into_lines(&face, &text, count),
     };
 
     let size = match element.size {
         D30Scale::Value(size) => size,
         D30Scale::Auto { minus } => {
-            let (width, height, _) = measure(&font, Scale::uniform(MEASURING_SIZE), &lines);
+            let (width, height, _) = measure(&face, Scale::uniform(MEASURING_SIZE), &lines);
             if width == 0 || height == 0 {
                 1.0
             } else {
@@ -479,13 +606,13 @@ fn lay_out(
     // A size of nothing or less would draw nothing, or garbage.
     let scale = Scale::uniform(size.max(1.0));
 
-    let (width, height, advance) = measure(&font, scale, &lines);
+    let (width, height, advance) = measure(&face, scale, &lines);
     let line_widths = lines
         .iter()
-        .map(|line| text_size(scale, &font, line).0)
+        .map(|line| face.text_size(scale, line).0)
         .collect();
     Ok(Block {
-        font,
+        face,
         scale,
         lines,
         line_widths,
@@ -496,17 +623,15 @@ fn lay_out(
 }
 
 /// The width and height of the ink of a block of lines, and how far apart the lines are.
-fn measure(font: &Font, scale: Scale, lines: &[String]) -> (i32, i32, i32) {
-    let metrics = font.v_metrics(scale);
+fn measure(face: &Face, scale: Scale, lines: &[String]) -> (i32, i32, i32) {
+    let metrics = face.v_metrics(scale);
     let advance = (metrics.ascent - metrics.descent + metrics.line_gap).ceil() as i32;
     let width = lines
         .iter()
-        .map(|line| text_size(scale, font, line).0)
+        .map(|line| face.text_size(scale, line).0)
         .max()
         .unwrap_or(0);
-    let last_line_height = lines
-        .last()
-        .map_or(0, |line| text_size(scale, font, line).1);
+    let last_line_height = lines.last().map_or(0, |line| face.text_size(scale, line).1);
     let height = advance * (lines.len() as i32 - 1) + last_line_height;
     (width, height, advance)
 }
@@ -522,7 +647,7 @@ fn typed_lines(text: &str) -> Vec<String> {
 
 /// Divides the words of `text` over `count` lines (fewer if there are not enough words), with the
 /// breaks where the widest line comes out narrowest.
-fn split_into_lines(font: &Font, text: &str, count: usize) -> Vec<String> {
+fn split_into_lines(face: &Face, text: &str, count: usize) -> Vec<String> {
     // A no-break space belongs to its word: it is there to keep the words around it together.
     let words: Vec<&str> = text
         .split(|c: char| c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}'))
@@ -536,7 +661,7 @@ fn split_into_lines(font: &Font, text: &str, count: usize) -> Vec<String> {
         return vec![words.join(" ")];
     }
 
-    let spans = WordSpans::new(font, &words);
+    let spans = WordSpans::new(face, &words);
     let starts = best_breaks(words.len(), count, |first, last| spans.width(first, last));
     (0..count)
         .map(|line| {
@@ -558,16 +683,16 @@ struct WordSpans {
 }
 
 impl WordSpans {
-    fn new(font: &Font, words: &[&str]) -> Self {
+    fn new(face: &Face, words: &[&str]) -> Self {
         let scale = Scale::uniform(MEASURING_SIZE);
-        let space = advance(font, scale, " ");
+        let space = face.advance(scale, " ");
         let mut start = Vec::with_capacity(words.len());
         let mut end = Vec::with_capacity(words.len());
         let mut pen = 0.0;
         for word in words {
             start.push(pen);
-            end.push(pen + text_size(scale, font, word).0 as f32);
-            pen += advance(font, scale, word) + space;
+            end.push(pen + face.text_size(scale, word).0 as f32);
+            pen += face.advance(scale, word) + space;
         }
         WordSpans { start, end }
     }
@@ -680,13 +805,11 @@ fn draw(
             Align::Center => (spare as f32 / 2.0) as i32,
             Align::Right => spare,
         };
-        draw_text_mut(
+        block.face.draw(
             canvas,
-            Luma([255u8]),
             left + indent,
             top + index as i32 * block.advance,
             block.scale,
-            &block.font,
             line,
         );
     }
@@ -950,8 +1073,9 @@ mod tests {
 
     /// The lines that `Lines::Split(count)` makes of `text` in the built-in font.
     fn split(text: &str, count: usize) -> Vec<String> {
-        let font = Fonts::embedded().load(&FontSpec::default()).unwrap();
-        split_into_lines(&font, text, count)
+        let fonts = Fonts::embedded();
+        let font = fonts.load(&FontSpec::default()).unwrap();
+        split_into_lines(&Face::new(font, &fonts, text), text, count)
     }
 
     fn render_with(id: &str, text: &str, lines: Lines) -> Rendered {
@@ -1492,6 +1616,172 @@ mod tests {
         assert_eq!(" Right ".parse::<Side>(), Ok(Side::Right));
         assert_eq!("r".parse::<Side>(), Ok(Side::Right));
         assert!("middle".parse::<Side>().is_err());
+    }
+
+    // ---- emoji and other characters that the font of the label lacks ------------------------------
+
+    /// The embedded font, which lacks the emoji, and what draws them when it does.
+    fn dejavu() -> Font<'static> {
+        Fonts::embedded().load(&FontSpec::default()).unwrap()
+    }
+
+    /// An apple: an emoji from Unicode 6, which the built-in emoji font has and DejaVu Sans lacks.
+    const APPLE: char = '\u{1f34e}';
+    /// A character that no font here has.
+    const NOWHERE: char = '\u{10fffd}';
+
+    fn ink(rendered: &Rendered) -> usize {
+        rendered
+            .canvas()
+            .pixels()
+            .filter(|pixel| pixel[0] > 127)
+            .count()
+    }
+
+    #[test]
+    fn the_test_characters_are_what_they_are_said_to_be() {
+        let fonts = Fonts::embedded();
+        let dejavu = dejavu();
+        assert!(!has_glyph(&dejavu, APPLE), "DejaVu Sans lacks the apple");
+        assert!(
+            fonts.fallback_draws(APPLE),
+            "the built-in emoji font has it"
+        );
+        assert!(!has_glyph(&dejavu, NOWHERE) && !fonts.fallback_draws(NOWHERE));
+        assert!(has_glyph(&dejavu, 'A'));
+    }
+
+    #[test]
+    fn an_emoji_is_drawn_by_the_fallback_font_and_not_as_a_box() {
+        let apple = render_text("12x40", &APPLE.to_string());
+        let nowhere = render_text("12x40", &NOWHERE.to_string());
+        // Both draw something (the second, the box that DejaVu Sans draws for what it lacks), but
+        // not the same thing.
+        assert!(ink(&apple) > 0 && ink(&nowhere) > 0);
+        assert_ne!(apple.canvas().as_raw(), nowhere.canvas().as_raw());
+        // The apple is a solid shape and the box an outline.
+        assert!(
+            ink(&apple) > 2 * ink(&nowhere),
+            "{} against {}",
+            ink(&apple),
+            ink(&nowhere)
+        );
+    }
+
+    #[test]
+    fn text_with_an_emoji_in_it_keeps_its_letters_and_adds_the_emoji() {
+        // Left aligned and at a set size, so that the letters are where they were without the emoji.
+        let left_aligned = |text: &str| {
+            let mut label = Label::text(stock("15-continuous"), text);
+            let element = text_mut(&mut label);
+            element.size = D30Scale::Value(40.0);
+            element.align = Align::Left;
+            render(&label, &Fonts::embedded()).unwrap()
+        };
+        let plain = left_aligned("Apples");
+        let with_apple = left_aligned(&format!("Apples {APPLE}"));
+        assert_eq!(
+            ink_columns(&plain).unwrap().0,
+            ink_columns(&with_apple).unwrap().0
+        );
+        assert!(ink_columns(&with_apple).unwrap().1 > ink_columns(&plain).unwrap().1 + 20);
+        assert!(ink(&with_apple) > ink(&plain));
+        assert!(with_apple.length_dots() > plain.length_dots());
+    }
+
+    #[test]
+    fn text_without_anything_missing_never_uses_the_fallback_fonts() {
+        let fonts = Fonts::embedded();
+        let face = Face::new(dejavu(), &fonts, "Hello, tape! 12:30");
+        assert!(face.fallbacks.is_empty());
+        let face = Face::new(dejavu(), &fonts, &format!("Hello {APPLE}"));
+        assert!(!face.fallbacks.is_empty());
+        // A line is cut into the pieces that each font draws.
+        let line = format!("ab{APPLE}{APPLE}cd");
+        let runs = face.runs(&line);
+        let apples = format!("{APPLE}{APPLE}");
+        assert_eq!(
+            runs.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            ["ab", apples.as_str(), "cd"]
+        );
+        assert_eq!(runs[0].0, 0);
+        assert_ne!(runs[1].0, 0);
+        assert_eq!(runs[2].0, 0);
+        assert!(face.runs("").is_empty());
+    }
+
+    #[test]
+    fn what_only_asks_for_the_emoji_form_is_not_drawn() {
+        let plain = render_text("12x40", &APPLE.to_string());
+        for extra in ["\u{fe0f}", "\u{fe0e}", "\u{200d}", "\u{1f3fd}", "\u{e0067}"] {
+            let with_extra = render_text("12x40", &format!("{APPLE}{extra}"));
+            assert_eq!(
+                plain.canvas().as_raw(),
+                with_extra.canvas().as_raw(),
+                "U+{:04X} should not be drawn",
+                extra.chars().next().unwrap() as u32
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_are_measured_so_that_the_text_fits_the_label() {
+        for text in [
+            APPLE.to_string(),
+            format!("{APPLE}{APPLE}{APPLE}"),
+            format!("Apple {APPLE}"),
+            format!("{APPLE} pie\n{APPLE} jam"),
+        ] {
+            let rendered = render_text("12x40", &text);
+            let (top, bottom) = ink_rows(&rendered).unwrap();
+            let (_, last) = ink_columns(&rendered).unwrap();
+            assert!(bottom < 96, "{text:?}: ink down to row {bottom}");
+            assert!(last < 320, "{text:?}: ink as far as column {last}");
+            assert!(
+                (bottom - top) > 20,
+                "{text:?}: the text is only {} dots high",
+                bottom - top
+            );
+        }
+    }
+
+    #[test]
+    fn text_with_emoji_can_be_split_over_lines() {
+        let text = format!("{APPLE} apple pie {APPLE} and cream");
+        for count in 1..=3 {
+            let lines = split(&text, count);
+            assert_eq!(lines.len(), count);
+            assert_eq!(lines.join(" "), text);
+        }
+        let rendered = render_with("12x40", &text, Lines::Split(2));
+        assert!(ink(&rendered) > 0);
+    }
+
+    #[test]
+    fn a_character_that_no_font_has_is_drawn_as_the_box_and_nothing_fails() {
+        for text in [
+            NOWHERE.to_string(),
+            format!("a{NOWHERE}b"),
+            format!("{NOWHERE}{APPLE}{NOWHERE}"),
+        ] {
+            let rendered = render_text("12x40", &text);
+            assert!(ink(&rendered) > 0, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_chosen_font_that_lacks_the_emoji_gets_the_fallback_too() {
+        // A font file is another font than the embedded one.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/DejaVuSans.ttf");
+        let mut label = Label::text(stock("12x40"), format!("Hi {APPLE}"));
+        text_mut(&mut label).font = FontSpec::parse(path);
+        let rendered = render(&label, &Fonts::embedded()).unwrap();
+        let plain = {
+            let mut label = Label::text(stock("12x40"), "Hi ");
+            text_mut(&mut label).font = FontSpec::parse(path);
+            render(&label, &Fonts::embedded()).unwrap()
+        };
+        assert!(ink(&rendered) > ink(&plain));
     }
 
     #[test]

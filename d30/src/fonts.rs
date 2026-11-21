@@ -1,7 +1,7 @@
 //! Finding fonts: the one built into the library, the ones installed on the computer, and font
 //! files.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::OnceLock};
 
 use fontdb::{Database, Family, Query, Stretch, Style, Weight};
 use rusttype::Font;
@@ -10,6 +10,15 @@ use snafu::{OptionExt, ResultExt};
 use crate::{CouldNotInitFontSnafu, CouldNotReadFontFileSnafu, D30Error};
 
 const EMBEDDED_FONT: &[u8] = include_bytes!("DejaVuSans.ttf");
+
+/// Noto Emoji (monochrome, version 1.05, SIL Open Font License, see `NotoEmoji-OFL.txt`). It is the
+/// last resort for emoji, which are black and white here, as a label printer prints them. It only has
+/// the emoji up to Unicode 7 or so; Windows has a much newer one (see below).
+const EMOJI_FONT: &[u8] = include_bytes!("NotoEmoji-Regular.ttf");
+
+/// Installed fonts that have emoji, best first. They are drawn in black and white from the plain
+/// outlines that these fonts keep under their colors.
+const EMOJI_FAMILIES: &[&str] = &["Segoe UI Emoji", "Noto Emoji"];
 
 /// The family name of the font that is built into the library.
 pub const EMBEDDED_FAMILY: &str = "DejaVu Sans";
@@ -71,6 +80,9 @@ pub struct Fonts {
     installed: Option<Database>,
     /// The family names of everything above, plus the built-in one, in alphabetical order.
     families: Vec<String>,
+    /// The fonts for what the font of a label lacks. Found when they are first asked for, because
+    /// a font with all the emoji is big.
+    fallbacks: OnceLock<Vec<Font<'static>>>,
 }
 
 impl Fonts {
@@ -79,6 +91,7 @@ impl Fonts {
         Fonts {
             installed: None,
             families: vec![EMBEDDED_FAMILY.to_string()],
+            fallbacks: OnceLock::new(),
         }
     }
 
@@ -99,6 +112,7 @@ impl Fonts {
         Fonts {
             installed: Some(database),
             families,
+            fallbacks: OnceLock::new(),
         }
     }
 
@@ -127,7 +141,39 @@ impl Fonts {
         }
     }
 
-    fn load_installed(&self, name: &str, spec: &FontSpec) -> Option<Font<'static>> {
+    /// The fonts that draw what the font of a label has no glyph for, which is mostly emoji, in the
+    /// order they are tried: the emoji fonts installed on this computer (Windows has a recent one),
+    /// then the small one built into the library, which knows the older emoji. The first time this
+    /// is asked for it reads them, which can take a moment.
+    pub fn fallbacks(&self) -> &[Font<'static>] {
+        self.fallbacks.get_or_init(|| {
+            let plain = FontSpec::default();
+            let mut fonts: Vec<Font<'static>> = EMOJI_FAMILIES
+                .iter()
+                .filter_map(|family| self.load_installed(family, &plain))
+                .collect();
+            fonts.extend(Font::try_from_bytes(EMOJI_FONT));
+            fonts
+        })
+    }
+
+    /// Whether one of the [`Self::fallbacks`] draws `c`.
+    pub fn fallback_draws(&self, c: char) -> bool {
+        self.fallbacks().iter().any(|font| has_glyph(font, c))
+    }
+
+    /// The file of the installed emoji font that the fallbacks use, and which font in it, for a
+    /// program that draws text itself and wants to show the same emoji. `None` if no emoji font is
+    /// installed (or the installed fonts were not asked for), which leaves the built-in one.
+    pub fn installed_emoji_font(&self) -> Option<(Vec<u8>, u32)> {
+        let database = self.installed.as_ref()?;
+        EMOJI_FAMILIES.iter().find_map(|family| {
+            let id = self.find_installed(family, &FontSpec::default())?;
+            database.with_face_data(id, |data, index| (data.to_vec(), index))
+        })
+    }
+
+    fn find_installed(&self, name: &str, spec: &FontSpec) -> Option<fontdb::ID> {
         let database = self.installed.as_ref()?;
         // The database compares family names exactly, so find the name the way it is spelled.
         let wanted = name.to_lowercase();
@@ -151,13 +197,23 @@ impl Fonts {
                 Style::Normal
             },
         };
-        let id = database.query(&query)?;
+        database.query(&query)
+    }
+
+    fn load_installed(&self, name: &str, spec: &FontSpec) -> Option<Font<'static>> {
+        let database = self.installed.as_ref()?;
+        let id = self.find_installed(name, spec)?;
         database
             .with_face_data(id, |data, index| {
                 Font::try_from_vec_and_index(data.to_vec(), index)
             })
             .flatten()
     }
+}
+
+/// Whether `font` has a glyph for `c`, and not just the box it draws for what it lacks.
+pub fn has_glyph(font: &Font<'_>, c: char) -> bool {
+    font.glyph(c).id().0 != 0
 }
 
 fn embedded_font() -> Result<Font<'static>, D30Error> {
