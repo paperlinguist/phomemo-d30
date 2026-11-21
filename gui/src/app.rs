@@ -842,6 +842,9 @@ impl App {
             .default_size(340.0)
             .min_size(280.0)
             .show(ui, |ui| {
+                // The settings can be taller than the window, and a scroll bar that only shows
+                // when the mouse is over it does not tell that there is more below.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
             });
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui));
@@ -1094,7 +1097,17 @@ mod tests {
     }
 
     /// Lays the window out on a screen of this size, as egui would draw it, and returns the text.
-    fn lay_out(app: &mut App, [width, height]: [f32; 2]) -> Vec<Shown> {
+    fn lay_out(app: &mut App, size: [f32; 2]) -> Vec<Shown> {
+        lay_out_with(app, size, |_| {})
+    }
+
+    /// Like [`lay_out`], with something done to what egui is told about the world each frame
+    /// (a file held over the window, for instance).
+    fn lay_out_with(
+        app: &mut App,
+        [width, height]: [f32; 2],
+        adjust: impl Fn(&mut egui::RawInput),
+    ) -> Vec<Shown> {
         fn collect(shape: &egui::Shape, shown: &mut Vec<Shown>) {
             match shape {
                 egui::Shape::Text(text) => shown.push(Shown {
@@ -1112,10 +1125,11 @@ mod tests {
         let mut shown = Vec::new();
         // Panels and the like find their sizes over a few frames, so keep what the last one drew.
         for _ in 0..3 {
-            let input = egui::RawInput {
+            let mut input = egui::RawInput {
                 screen_rect: Some(screen),
                 ..Default::default()
             };
+            adjust(&mut input);
             let output = context.run_ui(input, |ui| app.show(ui));
             shown.clear();
             for clipped in &output.shapes {
@@ -1271,6 +1285,21 @@ mod tests {
         };
         let canvas = preview.rendered.canvas();
         assert!(canvas.get_pixel(40, 48)[0] > 127);
+    }
+
+    #[test]
+    fn while_a_file_is_held_over_the_window_it_says_what_will_happen() {
+        let mut app = test_app();
+        let said = |shown: &[Shown]| {
+            shown
+                .iter()
+                .any(|text| text.text == "Drop the picture here")
+        };
+        assert!(!said(&lay_out(&mut app, WINDOW_SIZE)));
+        let held = lay_out_with(&mut app, WINDOW_SIZE, |input| {
+            input.hovered_files = vec![egui::HoveredFile::default()];
+        });
+        assert!(said(&held));
     }
 
     #[test]
