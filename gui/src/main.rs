@@ -37,7 +37,8 @@ fn main() -> eframe::Result {
 }
 
 /// The options for trying things out: `--screenshot FILE` saves a picture of the window and closes
-/// it, and `--text`, `--label` and `--font` start with those chosen.
+/// it, and `--text`, `--lines`, `--label` and `--font` start with those chosen. So does
+/// `--picture FILE`, with `--picture-side left|right`, `--picture-dither` and `--picture-invert`.
 fn options_from_args() -> Options {
     let mut options = Options::default();
     let mut args = std::env::args().skip(1);
@@ -45,6 +46,13 @@ fn options_from_args() -> Options {
         match arg.as_str() {
             "--screenshot" => options.screenshot = args.next().map(PathBuf::from),
             "--text" => options.text = args.next(),
+            "--lines" => options.lines = args.next().and_then(|count| count.parse().ok()),
+            "--picture" => options.picture = args.next().map(PathBuf::from),
+            "--picture-side" => {
+                options.picture_side = args.next().and_then(|side| side.parse().ok())
+            }
+            "--picture-dither" => options.picture_dither = true,
+            "--picture-invert" => options.picture_invert = true,
             "--label" => options.label = args.next(),
             "--font" => options.font = args.next(),
             other => eprintln!("Ignoring the unknown option {other}"),
