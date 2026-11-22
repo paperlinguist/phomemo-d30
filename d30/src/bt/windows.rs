@@ -15,13 +15,19 @@ use advmac::MacAddr6;
 use windows_sys::{
     core::GUID,
     Win32::{
-        Devices::Bluetooth::{AF_BTH, BTHPROTO_RFCOMM, SOCKADDR_BTH},
+        Devices::Bluetooth::{
+            BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindNextDevice, AF_BTH,
+            BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BTHPROTO_RFCOMM, SOCKADDR_BTH,
+        },
+        Foundation::{GetLastError, ERROR_NO_MORE_ITEMS},
         Networking::WinSock::{
             closesocket, connect as winsock_connect, send, socket, WSACleanup, WSAGetLastError,
             WSAStartup, INVALID_SOCKET, SOCKADDR, SOCKET, SOCKET_ERROR, SOCK_STREAM, WSADATA,
         },
     },
 };
+
+use super::PairedDevice;
 
 /// Everything the Windows Bluetooth stack can fail with is a plain OS error (a Winsock code).
 pub type Error = io::Error;
@@ -128,6 +134,67 @@ impl Write for RfcommStream {
     fn flush(&mut self) -> io::Result<()> {
         // Nothing is buffered on our side; `send` hands the bytes straight to the Bluetooth stack.
         Ok(())
+    }
+}
+
+/// Lists the Bluetooth devices Windows has paired ("remembered" devices).
+///
+/// This only reads what Windows already knows and does not scan the air for new devices, so it
+/// returns right away.
+pub fn list_paired_devices() -> io::Result<Vec<PairedDevice>> {
+    let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
+        dwSize: mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
+        fReturnAuthenticated: 1,
+        fReturnRemembered: 1,
+        fReturnUnknown: 0,
+        fReturnConnected: 1,
+        fIssueInquiry: 0,
+        cTimeoutMultiplier: 0,
+        // A null radio handle searches all Bluetooth radios.
+        hRadio: ptr::null_mut(),
+    };
+    // SAFETY: `BLUETOOTH_DEVICE_INFO` is plain old data for which all-zeroes is a valid value. Its
+    // size field has to be filled in before it is passed to the search functions.
+    let mut info: BLUETOOTH_DEVICE_INFO = unsafe { mem::zeroed() };
+    info.dwSize = mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+
+    // SAFETY: both pointers refer to fully initialised structures that outlive the call.
+    let find = unsafe { BluetoothFindFirstDevice(&params, &mut info) };
+    if find.is_null() {
+        // SAFETY: takes no arguments and only reads thread-local state.
+        let code = unsafe { GetLastError() };
+        // Having no paired devices (or no Bluetooth radio) is not an error.
+        return if code == ERROR_NO_MORE_ITEMS {
+            Ok(Vec::new())
+        } else {
+            Err(io::Error::from_raw_os_error(code as i32))
+        };
+    }
+
+    let mut devices = vec![device_from(&info)];
+    // SAFETY: `find` is a live search handle and `info` has its size set.
+    while unsafe { BluetoothFindNextDevice(find, &mut info) } != 0 {
+        devices.push(device_from(&info));
+    }
+    // SAFETY: `find` is a live search handle, closed exactly once.
+    unsafe { BluetoothFindDeviceClose(find) };
+    Ok(devices)
+}
+
+fn device_from(info: &BLUETOOTH_DEVICE_INFO) -> PairedDevice {
+    // SAFETY: both views of the address union are plain integers, so reading `ullLong` is valid.
+    let number = unsafe { info.Address.Anonymous.ullLong };
+    let bytes = number.to_be_bytes();
+    let name_len = info
+        .szName
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(info.szName.len());
+    PairedDevice {
+        name: String::from_utf16_lossy(&info.szName[..name_len]),
+        // The address is a 48-bit number held in a u64, so its first two big-endian bytes are zero.
+        address: MacAddr6::new([bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]),
+        connected: info.fConnected != 0,
     }
 }
 
