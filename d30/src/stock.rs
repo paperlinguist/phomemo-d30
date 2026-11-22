@@ -75,6 +75,10 @@ pub struct LabelStock {
     /// The length of one label, or `None` for continuous tape.
     pub length_mm: Option<f32>,
     pub media: Media,
+    /// The gap between two labels on the roll, in mm, where it is known. Labels with a known gap are
+    /// not left to the printer's own label sensing, which cannot print the whole of a label with a
+    /// wide gap: the program counts the rows instead, see [`LabelStock::tape_plan`].
+    pub gap_mm: Option<f32>,
     /// Whether this has been tried on a real printer.
     pub tested: bool,
 }
@@ -84,6 +88,7 @@ const fn precut(
     name: &'static str,
     width_mm: f32,
     length_mm: f32,
+    gap_mm: Option<f32>,
     tested: bool,
 ) -> LabelStock {
     LabelStock {
@@ -92,6 +97,7 @@ const fn precut(
         width_mm,
         length_mm: Some(length_mm),
         media: Media::Gap,
+        gap_mm,
         tested,
     }
 }
@@ -108,8 +114,36 @@ const fn continuous(
         width_mm,
         length_mm: None,
         media: Media::Continuous,
+        gap_mm: None,
         tested,
     }
+}
+
+/// How far the tear edge of the printer is beyond the print head, in mm: measured on a D30 as about
+/// 7 mm (roughly 55 rows).
+pub const HEAD_TO_TEAR_MM: f32 = 7.0;
+
+/// Where the printer's own label sensing leaves the print head when a print in gap mode is done, as
+/// the program counts it: 1.3 mm past the back edge of the label it printed, at the start of the gap.
+/// The first row of a print is seen to land about 0.6 mm past that edge, but with 0.6 the first label
+/// after positioning the tape came out 0.7 mm too far toward its front, and 1.3 is what centers it.
+/// Measured on 14 × 30 mm labels, and the same after every print.
+pub const GAP_MODE_PARK_MM: f32 = 1.3;
+
+/// How the rows of one label go onto the tape: what the printer is told about the stock, how many
+/// rows of the label to leave out, and how many blank rows come before and after it. See
+/// [`LabelStock::tape_plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapePlan {
+    /// What the printer is told about the stock.
+    pub media: Media,
+    /// Rows at the front of the label that are not printed, because the print head is already past
+    /// them.
+    pub skip_rows: usize,
+    /// Blank rows to print before the label.
+    pub lead_rows: usize,
+    /// Blank rows to feed after the label.
+    pub feed_rows: usize,
 }
 
 /// How many blank rows to print in front of a label on uncut tape.
@@ -136,13 +170,23 @@ pub const CONTINUOUS_FEED_ROWS: usize = 134;
 ///
 /// Anything else can be given as `WIDTHxLENGTH`, for example `12x35`, or `WIDTH-continuous`.
 pub static STOCKS: &[LabelStock] = &[
-    precut("12x40", "12 × 40 mm precut labels", 12.0, 40.0, true),
-    precut("12x30", "12 × 30 mm precut labels", 12.0, 30.0, false),
-    precut("14x40", "14 × 40 mm precut labels", 14.0, 40.0, false),
-    precut("14x30", "14 × 30 mm precut labels", 14.0, 30.0, false),
-    precut("14x28", "14 × 28 mm precut labels", 14.0, 28.0, false),
-    precut("14x50", "14 × 50 mm precut labels", 14.0, 50.0, false),
-    precut("15x50", "15 × 50 mm precut labels", 15.0, 50.0, false),
+    precut("12x40", "12 × 40 mm precut labels", 12.0, 40.0, None, true),
+    precut("12x30", "12 × 30 mm precut labels", 12.0, 30.0, None, false),
+    precut("14x40", "14 × 40 mm precut labels", 14.0, 40.0, None, false),
+    // Measured on the labels it was tried with: 30.2 mm long with a gap of 8 mm between them, which
+    // the program counts itself (so the 0.2 mm count: 38.2 mm from one label to the next, which is
+    // what a print has to be long, or the labels drift by 0.2 mm each).
+    precut(
+        "14x30",
+        "14 × 30 mm precut labels",
+        14.0,
+        30.2,
+        Some(8.0),
+        true,
+    ),
+    precut("14x28", "14 × 28 mm precut labels", 14.0, 28.0, None, false),
+    precut("14x50", "14 × 50 mm precut labels", 14.0, 50.0, None, false),
+    precut("15x50", "15 × 50 mm precut labels", 15.0, 50.0, None, false),
     continuous(
         "12-continuous",
         "12 mm continuous (uncut) tape",
@@ -186,13 +230,96 @@ impl LabelStock {
         }
     }
 
-    /// The blank rows to feed after printing a label of this stock: none for precut labels, which
-    /// the printer positions itself, and [`CONTINUOUS_FEED_ROWS`] for uncut tape.
+    /// The gap between two labels, for labels of a set length whose gap is known. Those are the
+    /// labels the program keeps track of itself instead of leaving it to the printer.
+    pub fn counted_gap_mm(&self) -> Option<f32> {
+        self.length_mm.and(self.gap_mm)
+    }
+
+    /// How the printer is told to find its way on this stock: the label's own way, except where the
+    /// program counts the rows itself (see [`LabelStock::tape_plan`]), when it is told the tape is
+    /// uncut so that it does not try to find the labels, and prints every row it is sent.
+    pub fn print_media(&self) -> Media {
+        if self.counted_gap_mm().is_some() {
+            Media::Continuous
+        } else {
+            self.media
+        }
+    }
+
+    /// How many rows at the front of a counted label (the end that comes out first) are already
+    /// past the print head when printing starts, so that they cannot be printed.
+    ///
+    /// The tape is torn in the middle of the gap, where the cut line is, and the tear edge is
+    /// [`HEAD_TO_TEAR_MM`] beyond the print head. After a tear there the head is that much less half
+    /// the gap already into the next label: with the 8 mm gap of the 14 × 30 mm labels, 7 - 4 =
+    /// 3 mm, which is 24 rows.
+    pub fn dead_front_rows(&self) -> usize {
+        self.counted_gap_mm().map_or(0, |gap| {
+            mm_to_dots((HEAD_TO_TEAR_MM - gap / 2.0).max(0.0)) as usize
+        })
+    }
+
+    /// How many blank rows to feed, as uncut tape, after a blank label in gap mode (which the
+    /// printer finds the gap for by itself, and then parks the head at the start of the gap, see
+    /// [`GAP_MODE_PARK_MM`]) to leave the tape where the program expects it when it counts the rows:
+    /// the middle of the gap at the tear edge. That is the gap, what the printer parks beyond the
+    /// label, and the rows that cannot be printed: 8 + 1.3 mm and 3 mm, 98 rows, for the 14 × 30 mm
+    /// labels. `0` for stocks that are not counted.
+    pub fn position_feed_rows(&self) -> usize {
+        self.counted_gap_mm().map_or(0, |gap| {
+            mm_to_dots(gap + GAP_MODE_PARK_MM) as usize + self.dead_front_rows()
+        })
+    }
+
+    /// The blank rows to feed after printing a label of this stock: [`CONTINUOUS_FEED_ROWS`] for uncut
+    /// tape, nothing for precut labels (the printer positions the 12 × 40 mm labels itself), and for
+    /// labels that are counted (see [`LabelStock::tape_plan`]) the gap plus the rows that could not
+    /// be printed, which makes the print as long as the distance from one label to the next. That
+    /// is what leaves the middle of the gap at the tear edge. With the 14 × 30 mm labels it is
+    /// 64 + 24 = 88 rows. It can be set from the command line (`--feed-lines`) and in the window.
     pub fn default_feed_rows(&self) -> usize {
         if self.is_continuous() {
             CONTINUOUS_FEED_ROWS
         } else {
+            self.counted_gap_mm()
+                .map_or(0, |gap| mm_to_dots(gap) as usize + self.dead_front_rows())
+        }
+    }
+
+    /// How to lay out the rows of one label on the tape, for printing with `media` (the stock's
+    /// own way by default), `lead` blank rows in front and `feed` blank rows behind the label
+    /// (the defaults of the stock where they are `None`).
+    ///
+    /// **Counted labels.** The D30's own way of finding labels (gaps) starts the print in the gap
+    /// behind the label before, about 9 mm ahead of the label for the 14 × 30 mm labels, and stops
+    /// it when the label is over, so that the last 8 mm of the label cannot be printed. So these
+    /// labels, whose gap is known, are printed as if they were uncut tape and the program keeps
+    /// count. A print is exactly one label plus its gap long, 38.2 mm (306 rows) for the 14 × 30 mm
+    /// labels, and it ends with the middle of the gap, where the cut line is, at the tear edge.
+    /// The tape is torn there, which is where the next print starts: the print head then is
+    /// [`LabelStock::dead_front_rows`] into the label, which is why those rows are left out.
+    /// Everything stays in step as long as the tape is torn at the tear edge and not pulled or
+    /// fed by hand, and the printer's button is not pressed (that feeds the tape to where the
+    /// printer thinks the next label is).
+    pub fn tape_plan(
+        &self,
+        media: Option<Media>,
+        lead: Option<usize>,
+        feed: Option<usize>,
+    ) -> TapePlan {
+        let media = media.unwrap_or_else(|| self.print_media());
+        let counted = self.counted_gap_mm().is_some() && media == Media::Continuous;
+        let default_feed = if counted || self.is_continuous() {
+            self.default_feed_rows()
+        } else {
             0
+        };
+        TapePlan {
+            media,
+            skip_rows: if counted { self.dead_front_rows() } else { 0 },
+            lead_rows: lead.unwrap_or_else(|| self.default_lead_rows()),
+            feed_rows: feed.unwrap_or(default_feed),
         }
     }
 
@@ -229,6 +356,7 @@ impl LabelStock {
                     width_mm: width,
                     length_mm: Some(length),
                     media: Media::Gap,
+                    gap_mm: None,
                     tested: false,
                 });
             }
@@ -246,6 +374,7 @@ impl LabelStock {
                     width_mm: width,
                     length_mm: None,
                     media: Media::Continuous,
+                    gap_mm: None,
                     tested: false,
                 });
             }
@@ -398,13 +527,126 @@ mod tests {
     }
 
     #[test]
+    fn labels_with_a_known_gap_are_counted_and_end_with_the_middle_of_the_gap_at_the_tear_edge() {
+        let stock = LabelStock::parse("14x30").unwrap();
+        assert_eq!(stock.gap_mm, Some(8.0));
+        assert_eq!(stock.counted_gap_mm(), Some(8.0));
+        assert_eq!(stock.media, Media::Gap);
+        assert_eq!(stock.print_media(), Media::Continuous);
+        // The middle of the gap is 4 mm from the label and the tear edge 7 mm from the head, so
+        // the head starts 3 mm (24 rows) into each label.
+        assert_eq!(stock.dead_front_rows(), 24);
+        // The gap is 64 rows, and with the rows that were left out that makes 88.
+        assert_eq!(stock.default_feed_rows(), 88);
+        assert_eq!(stock.default_lead_rows(), 0);
+        assert_eq!(
+            stock.tape_plan(None, None, None),
+            TapePlan {
+                media: Media::Continuous,
+                skip_rows: 24,
+                lead_rows: 0,
+                feed_rows: 88,
+            }
+        );
+
+        // Getting there from where the printer parks the head after a blank label (8 + 1.3 mm
+        // past the label, then the 24 rows that cannot be printed): 74 + 24 = 98 rows.
+        assert_eq!(stock.position_feed_rows(), 98);
+        assert_eq!(LabelStock::parse("12x40").unwrap().position_feed_rows(), 0);
+
+        // One print is one label plus its gap long (30.2 + 8 mm = 306 rows), so that the next
+        // print starts where this one ends, in step with the labels.
+        let plan = stock.tape_plan(None, None, None);
+        let label_rows = stock.length_dots().unwrap() as usize;
+        assert_eq!(label_rows, 242);
+        assert_eq!(
+            label_rows - plan.skip_rows + plan.lead_rows + plan.feed_rows,
+            mm_to_dots(30.2 + 8.0) as usize
+        );
+        assert_eq!(mm_to_dots(30.2 + 8.0), 306);
+
+        // The head must not be further into the label than the tear edge leaves it: the rows that
+        // cannot be printed are fewer than the rows of the label.
+        for stock in STOCKS.iter().filter(|stock| stock.gap_mm.is_some()) {
+            assert!(stock.dead_front_rows() < stock.length_dots().unwrap() as usize);
+        }
+    }
+
+    #[test]
+    fn other_stocks_are_left_to_the_printer_and_to_the_defaults_they_had() {
+        // Where the gap is not known nothing is counted and nothing is fed: the 12 x 40 mm labels
+        // come out far enough by themselves, and a size that is typed in could be anything.
+        for id in ["12x40", "14x50", "14x31", "12x35"] {
+            let stock = LabelStock::parse(id).unwrap();
+            assert_eq!(stock.counted_gap_mm(), None, "{id}");
+            assert_eq!(stock.print_media(), Media::Gap, "{id}");
+            assert_eq!(stock.dead_front_rows(), 0, "{id}");
+            assert_eq!(
+                stock.tape_plan(None, None, None),
+                TapePlan {
+                    media: Media::Gap,
+                    skip_rows: 0,
+                    lead_rows: 0,
+                    feed_rows: 0,
+                },
+                "{id}"
+            );
+        }
+        let tape = LabelStock::parse("15-continuous").unwrap();
+        assert_eq!(tape.print_media(), Media::Continuous);
+        assert_eq!(
+            tape.tape_plan(None, None, None),
+            TapePlan {
+                media: Media::Continuous,
+                skip_rows: 0,
+                lead_rows: CONTINUOUS_LEAD_ROWS,
+                feed_rows: CONTINUOUS_FEED_ROWS,
+            }
+        );
+    }
+
+    #[test]
+    fn what_is_asked_for_replaces_the_defaults_and_another_media_turns_counting_off() {
+        let counted = LabelStock::parse("14x30").unwrap();
+        let plan = counted.tape_plan(None, Some(5), Some(7));
+        assert_eq!(
+            (plan.skip_rows, plan.lead_rows, plan.feed_rows),
+            (24, 5, 7)
+        );
+
+        // Told to leave it to the printer, the labels are not counted: nothing is left out or fed.
+        let plan = counted.tape_plan(Some(Media::Gap), None, None);
+        assert_eq!(
+            plan,
+            TapePlan {
+                media: Media::Gap,
+                skip_rows: 0,
+                lead_rows: 0,
+                feed_rows: 0,
+            }
+        );
+
+        // Uncut tape on a label whose gap is not known has no front to leave out.
+        let plain = LabelStock::parse("12x40").unwrap();
+        assert_eq!(
+            plain.tape_plan(Some(Media::Continuous), None, None),
+            TapePlan {
+                media: Media::Continuous,
+                skip_rows: 0,
+                lead_rows: 0,
+                feed_rows: 0,
+            }
+        );
+    }
+
+    #[test]
     fn only_what_has_been_tried_on_a_printer_is_marked_as_tested() {
         let tested: Vec<_> = STOCKS
             .iter()
             .filter(|stock| stock.tested)
             .map(|stock| stock.id.to_string())
             .collect();
-        assert_eq!(tested, ["12x40", "15-continuous"]);
+        assert_eq!(tested, ["12x40", "14x30", "15-continuous"]);
     }
 
     #[test]

@@ -14,15 +14,17 @@ use d30::{
     bt,
     devices::{self, Device},
     fonts::Fonts,
+    picture::Picture,
     printer::{self, Command, Event, Job, Printer},
-    render::{self, Align},
-    stock::STOCKS,
+    render::{self, Align, Lines, Side},
+    stock::{LabelStock, STOCKS},
 };
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
+    emoji::{self, Emoji},
     preview::Preview,
-    settings::{LabelSettings, Saved},
+    settings::{LabelSettings, PictureSettings, Saved},
 };
 
 /// How big the window starts out, and the smallest it can be made, in points.
@@ -35,8 +37,17 @@ pub struct Options {
     /// Save a picture of the window and close it.
     pub screenshot: Option<PathBuf>,
     pub text: Option<String>,
+    /// How many lines to split the text into; 0 for where it has new lines.
+    pub lines: Option<usize>,
     pub label: Option<String>,
     pub font: Option<String>,
+    /// A picture file to put on the label, and how: at which end, dithered, swapped.
+    pub picture: Option<PathBuf>,
+    pub picture_side: Option<Side>,
+    pub picture_dither: bool,
+    pub picture_invert: bool,
+    /// Open the emoji picker.
+    pub emoji: bool,
 }
 
 /// Which printer is chosen.
@@ -67,6 +78,95 @@ struct Status {
     text: String,
 }
 
+/// The emoji picker: what is typed in its search, which group it shows, and which emoji the fonts
+/// can draw.
+#[derive(Default)]
+struct EmojiPicker {
+    query: String,
+    group: usize,
+    /// For each group, the emoji of it that can be drawn. Found when the picker is first shown,
+    /// because that can mean reading a large font.
+    drawable: Option<Vec<Vec<Emoji>>>,
+    /// The search box is to be given the keyboard as soon as it is there.
+    focus_search: bool,
+    /// The picker is to open on its own, which is for trying things out.
+    open_now: bool,
+}
+
+impl EmojiPicker {
+    /// Shows the picker, and returns the emoji that was clicked on, if one was.
+    fn show(&mut self, ui: &mut egui::Ui, fonts: &Fonts) -> Option<char> {
+        let Self {
+            query,
+            group,
+            drawable,
+            focus_search,
+            open_now: _,
+        } = self;
+        let drawable = drawable.get_or_insert_with(|| {
+            emoji::GROUPS
+                .iter()
+                .map(|group| {
+                    group
+                        .emoji()
+                        .filter(|emoji| fonts.fallback_draws(emoji.symbol))
+                        .collect()
+                })
+                .collect()
+        });
+
+        ui.set_width(330.0);
+        let search = ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text("Search: carrot, home, heart…")
+                .desired_width(f32::INFINITY),
+        );
+        if std::mem::take(focus_search) {
+            search.request_focus();
+        }
+        let searching = !query.trim().is_empty();
+        if !searching {
+            ui.horizontal_wrapped(|ui| {
+                for (index, shown) in emoji::GROUPS.iter().enumerate() {
+                    ui.selectable_value(group, index, shown.icon.to_string())
+                        .on_hover_text(shown.name);
+                }
+            });
+            ui.label(RichText::new(emoji::GROUPS[*group].name).small().weak());
+        }
+        let shown: Vec<Emoji> = if searching {
+            emoji::search(query)
+                .into_iter()
+                .filter(|emoji| fonts.fallback_draws(emoji.symbol))
+                .collect()
+        } else {
+            drawable[(*group).min(drawable.len() - 1)].clone()
+        };
+
+        let mut chosen = None;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                if shown.is_empty() {
+                    ui.label("Nothing like that.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for emoji in &shown {
+                        let button =
+                            egui::Button::new(RichText::new(emoji.symbol.to_string()).size(22.0))
+                                .min_size(egui::vec2(34.0, 34.0))
+                                .frame(false);
+                        if ui.add(button).on_hover_text(emoji.name).clicked() {
+                            chosen = Some(emoji.symbol);
+                        }
+                    }
+                });
+            });
+        chosen
+    }
+}
+
 pub struct App {
     settings: LabelSettings,
     fonts: Fonts,
@@ -82,6 +182,8 @@ pub struct App {
     connection: Connection,
     /// A print is on its way to the printer.
     printing: bool,
+    /// What is on its way to the printer is the job that positions the tape, not a label.
+    positioning: bool,
     status: Status,
     /// What to check when the printer cannot be reached.
     help: Option<String>,
@@ -89,6 +191,14 @@ pub struct App {
     /// The label as drawn for `previewed`, or why it could not be drawn.
     preview: Option<Result<Preview, String>>,
     previewed: Option<LabelSettings>,
+
+    /// Why the picture could not be read, if that is so.
+    picture_error: Option<String>,
+    /// The person has asked to choose a picture file. The dialog is opened by [`eframe::App::ui`],
+    /// which has the window to put it in front of.
+    pick_picture: bool,
+
+    emoji: EmojiPicker,
 
     screenshot: Option<PathBuf>,
     screenshot_taken: Arc<AtomicBool>,
@@ -101,13 +211,9 @@ impl App {
         let printer = Printer::start(printer::Bluetooth, printer::CONNECT_ATTEMPTS, move || {
             context.request_repaint()
         });
-        Self::assemble(
-            Saved::load(),
-            devices::discover(),
-            Fonts::system(),
-            printer,
-            options,
-        )
+        let fonts = Fonts::system();
+        install_emoji_font(&cc.egui_ctx, &fonts);
+        Self::assemble(Saved::load(), devices::discover(), fonts, printer, options)
     }
 
     /// Puts the window together from what the outside world has provided: what was remembered, the
@@ -124,6 +230,12 @@ impl App {
         if let Some(text) = options.text {
             settings.text = text.replace("\\n", "\n");
         }
+        if let Some(count) = options.lines {
+            settings.lines = match count {
+                0 => Lines::AsTyped,
+                count => Lines::Split(count),
+            };
+        }
         if let Some(label) = options.label {
             settings.stock_id = label;
         }
@@ -138,7 +250,7 @@ impl App {
         let (choice, manual_address) =
             initial_choice(&discovery.devices, saved_address, discovery.default_address);
 
-        App {
+        let mut app = App {
             settings,
             fonts,
             devices: discovery.devices,
@@ -149,6 +261,7 @@ impl App {
             printer,
             connection: Connection::Disconnected,
             printing: false,
+            positioning: false,
             status: Status {
                 level: Level::Info,
                 text: match choice {
@@ -160,9 +273,52 @@ impl App {
             help: None,
             preview: None,
             previewed: None,
+            picture_error: None,
+            pick_picture: false,
+            emoji: EmojiPicker {
+                open_now: options.emoji,
+                ..Default::default()
+            },
             screenshot: options.screenshot,
             screenshot_taken: Arc::new(AtomicBool::new(false)),
             frames: 0,
+        };
+
+        // The picture on the label: the one that the command line names, or else the one that was
+        // on it last time (if its file can still be read).
+        if let Some(path) = options.picture {
+            app.load_picture(path);
+            if let Some(picture) = &mut app.settings.picture {
+                picture.side = options.picture_side.unwrap_or(picture.side);
+                picture.dither = options.picture_dither;
+                picture.invert = options.picture_invert;
+            }
+        } else if let Some(remembered) = &saved.picture {
+            if let Some(path) = remembered.path() {
+                match Picture::open(&path) {
+                    Ok(picture) => app.settings.picture = Some(remembered.settings(path, picture)),
+                    Err(error) => app.picture_error = Some(error.to_string()),
+                }
+            }
+        }
+        app
+    }
+
+    /// Puts the picture in this file on the label, or says why it cannot.
+    fn load_picture(&mut self, path: PathBuf) {
+        match Picture::open(&path) {
+            Ok(picture) => {
+                self.picture_error = None;
+                match &mut self.settings.picture {
+                    // Another picture takes the place of the one there is, set in the same way.
+                    Some(current) => {
+                        current.path = path;
+                        current.picture = picture;
+                    }
+                    None => self.settings.picture = Some(PictureSettings::new(path, picture)),
+                }
+            }
+            Err(error) => self.picture_error = Some(error.to_string()),
         }
     }
 
@@ -236,6 +392,7 @@ impl App {
                 Event::ConnectFailed(error) => {
                     self.connection = Connection::Failed;
                     self.printing = false;
+                    self.positioning = false;
                     let help = self
                         .address()
                         .map(|address| bt::connection_help(&Self::address_text(address)));
@@ -254,7 +411,24 @@ impl App {
                 }
                 Event::Printing { copy, of } => {
                     self.printing = true;
-                    self.say(Level::Info, format!("Printing label {copy} of {of}…"));
+                    if self.positioning {
+                        self.say(
+                            Level::Info,
+                            "Positioning the tape: a blank label comes out first, then the tape \
+                             moves on a little. This takes about 20 seconds…",
+                        );
+                    } else {
+                        self.say(Level::Info, format!("Printing label {copy} of {of}…"));
+                    }
+                }
+                Event::Printed { .. } if self.positioning => {
+                    self.printing = false;
+                    self.positioning = false;
+                    self.say(
+                        Level::Good,
+                        "The tape is positioned. Tear off what came out at the printer's edge: \
+                         the printed line is on the edge.",
+                    );
                 }
                 Event::Printed { copies } => {
                     self.printing = false;
@@ -270,6 +444,7 @@ impl App {
                 }
                 Event::PrintFailed(error) => {
                     self.printing = false;
+                    self.positioning = false;
                     // When the print failed because the printer could not be reached, the
                     // message about that, which says why, is already on show. Keep it.
                     if !matches!(self.connection, Connection::Failed) {
@@ -305,13 +480,8 @@ impl App {
         let Some(Ok(preview)) = &self.preview else {
             return;
         };
-        let stock = &preview.stock;
-        let raster = preview
-            .rendered
-            .raster()
-            .and_then(|raster| raster.with_lead_rows(self.settings.lead_rows(stock)))
-            .and_then(|raster| raster.with_blank_rows(self.settings.feed_rows(stock)));
-        let raster = match raster {
+        let plan = self.settings.tape_plan(&preview.stock);
+        let raster = match preview.rendered.raster_for(&plan) {
             Ok(raster) => raster,
             Err(error) => {
                 let text = error.to_string();
@@ -320,13 +490,31 @@ impl App {
             }
         };
         let job = Job {
-            media: stock.media,
+            media: plan.media,
             raster,
             copies: self.settings.copies.max(1),
+            then: None,
         };
         self.printing = true;
         self.help = None;
         self.say(Level::Info, "Sending the label to the printer…");
+        self.printer.send(Command::Print { address, job });
+    }
+
+    /// Puts the tape where the program expects it to be for labels that it keeps count of: a
+    /// blank label, which the printer finds the gap for itself, and then a little more tape.
+    fn position_tape(&mut self, stock: &LabelStock) {
+        let Some(address) = self.address() else {
+            self.say(Level::Bad, "Choose a printer first.");
+            return;
+        };
+        let Some(job) = printer::position_tape(stock) else {
+            return;
+        };
+        self.printing = true;
+        self.positioning = true;
+        self.help = None;
+        self.say(Level::Info, "Sending the blank label to the printer…");
         self.printer.send(Command::Print { address, job });
     }
 
@@ -444,13 +632,43 @@ impl App {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        ui.heading("Text");
+        let text_id = egui::Id::unique("label text");
+        ui.horizontal(|ui| {
+            ui.heading("Text");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.emoji_button(ui, text_id);
+            });
+        });
+        let typing_hint = match self.settings.lines {
+            Lines::AsTyped => "Type the label here. Enter starts a new line.",
+            Lines::Split(_) => "Type the label here. It is split into lines for you.",
+        };
         ui.add(
             egui::TextEdit::multiline(&mut self.settings.text)
-                .hint_text("Type the label here. Enter starts a new line.")
+                .id(text_id)
+                .hint_text(typing_hint)
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
         );
+        ui.horizontal(|ui| {
+            ui.label("Lines:");
+            ui.selectable_value(&mut self.settings.lines, Lines::AsTyped, "As typed")
+                .on_hover_text("A new line only where you press Enter");
+            for count in 1..=MOST_LINES_OFFERED {
+                ui.selectable_value(
+                    &mut self.settings.lines,
+                    Lines::Split(count),
+                    count.to_string(),
+                )
+                .on_hover_text(format!(
+                    "Split the text over {count} line{}, as evenly as the words allow",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+        });
+        if let Some(hint) = lines_hint(self.settings.lines, &self.settings.text) {
+            ui.label(RichText::new(hint).small().weak());
+        }
 
         ui.add_space(10.0);
         ui.heading("Font");
@@ -501,6 +719,8 @@ impl App {
         });
         ui.add(egui::Slider::new(&mut self.settings.margin, 0.0..=60.0).text("margin (dots)"));
 
+        self.picture_section(ui);
+
         ui.add_space(10.0);
         ui.heading("Label");
         let preset_text = STOCKS
@@ -550,6 +770,37 @@ impl App {
                                 .suffix(" mm"),
                         );
                     });
+                }
+            }
+            Ok(stock) if stock.counted_gap_mm().is_some() => {
+                // The program keeps track of these labels itself, which only works if the tape
+                // is left alone between two labels.
+                ui.label(
+                    RichText::new(
+                        "These labels have a wide gap, so the program keeps track of where \
+                         they are. Tear each label off at the printer's edge (the printed \
+                         line is then at the edge), and do not pull the tape out or press \
+                         the printer's button. The first 3 mm of each label cannot be \
+                         printed, so the text keeps that far from the ends. After a new \
+                         roll, or if the tape was moved, press Position the tape.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let ready = self.address().is_some()
+                    && !self.printing
+                    && !matches!(self.connection, Connection::Connecting { .. });
+                let response = ui.add_enabled(ready, egui::Button::new("Position the tape"));
+                let response = if self.address().is_none() {
+                    response.on_disabled_hover_text("Choose a printer first")
+                } else {
+                    response.on_hover_text(
+                        "Feeds a blank label, so that the printer finds the gap, and then a \
+                         little more tape. Tear off what comes out at the printer's edge.",
+                    )
+                };
+                if response.clicked() {
+                    self.position_tape(&stock);
                 }
             }
             Ok(_) => {}
@@ -673,8 +924,127 @@ impl App {
 }
 
 impl App {
+    /// The button that opens the emoji picker, and the picker when it is open. An emoji that is
+    /// clicked goes into the text where the cursor was, and the picker stays open for the next.
+    fn emoji_button(&mut self, ui: &mut egui::Ui, text_id: egui::Id) {
+        let button = ui
+            .button("😀 Emoji")
+            .on_hover_text("Put an emoji in the text");
+        if button.clicked() {
+            self.emoji.focus_search = true;
+        }
+        let mut chosen = None;
+        let open_now = std::mem::take(&mut self.emoji.open_now);
+        egui::Popup::from_toggle_button_response(&button)
+            .open_memory(if button.clicked() {
+                Some(egui::SetOpenCommand::Toggle)
+            } else if open_now {
+                Some(egui::SetOpenCommand::Bool(true))
+            } else {
+                None
+            })
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| chosen = self.emoji.show(ui, &self.fonts));
+        if let Some(symbol) = chosen {
+            self.insert_into_text(ui.ctx(), text_id, symbol);
+        }
+    }
+
+    /// Puts `symbol` into the text where the cursor of the text box was (in place of what was
+    /// selected), or at the end if the cursor was never there, puts the cursor after it, and gives
+    /// the keyboard back to the text box.
+    fn insert_into_text(&mut self, ctx: &egui::Context, text_id: egui::Id, symbol: char) {
+        let mut state = egui::TextEdit::load_state(ctx, text_id).unwrap_or_default();
+        let selected = state.cursor.char_range().map(|range| {
+            let [start, end] = range.sorted_cursors();
+            (start.index.0, end.index.0)
+        });
+        let cursor = insert_at_cursor(&mut self.settings.text, selected, &symbol.to_string());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(cursor),
+            )));
+        state.store(ctx, text_id);
+        ctx.memory_mut(|memory| memory.request_focus(text_id));
+    }
+
+    /// The picture on the label: choosing it, and how it is turned into dots.
+    fn picture_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.heading("Picture");
+        ui.horizontal(|ui| {
+            if ui.button("Choose a picture…").clicked() {
+                self.pick_picture = true;
+            }
+            if self.settings.picture.is_some() && ui.button("Remove").clicked() {
+                self.settings.picture = None;
+                self.picture_error = None;
+            }
+        });
+        if let Some(error) = &self.picture_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let Some(picture) = &mut self.settings.picture else {
+            ui.label(
+                RichText::new("Or drop a picture file on the window.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        };
+
+        let name = picture
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ui.label(
+            RichText::new(format!(
+                "{name}  ({} × {} pixels)",
+                picture.picture.width(),
+                picture.picture.height()
+            ))
+            .small()
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Side:");
+            ui.selectable_value(&mut picture.side, Side::Left, "Left");
+            ui.selectable_value(&mut picture.side, Side::Right, "Right");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Dots:");
+            ui.selectable_value(&mut picture.dither, false, "Black and white")
+                .on_hover_text("For drawings, logos and writing");
+            ui.selectable_value(&mut picture.dither, true, "Photo")
+                .on_hover_text("Patterns of dots that follow the grays, for photographs");
+        });
+        if !picture.dither {
+            ui.add(egui::Slider::new(&mut picture.level, 1..=254).text("black below"))
+                .on_hover_text("Parts of the picture darker than this are black");
+        }
+        ui.checkbox(&mut picture.invert, "Swap black and white");
+        ui.checkbox(&mut picture.fit_height, "As high as the label allows");
+        if !picture.fit_height {
+            ui.add(egui::Slider::new(&mut picture.height, 8.0..=96.0).text("height (dots)"));
+        }
+    }
+
     /// The whole window, once.
     fn show(&mut self, ui: &mut egui::Ui) {
+        // A picture file dropped on the window goes on the label.
+        let dropped = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .first()
+                .map(|file| file.path().to_path_buf())
+        });
+        if let Some(path) = dropped {
+            self.load_picture(path);
+        }
+
         self.handle_printer_events();
         self.update_preview(ui.ctx());
 
@@ -684,22 +1054,132 @@ impl App {
             .default_size(340.0)
             .min_size(280.0)
             .show(ui, |ui| {
+                // The settings can be taller than the window, and a scroll bar that only shows
+                // when the mouse is over it does not tell that there is more below.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
             });
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui));
 
+        show_what_is_being_dropped(ui.ctx());
         self.handle_screenshot(ui);
     }
 }
 
+/// While a file is held over the window, covers it with what is going to happen if it is let go.
+fn show_what_is_being_dropped(ctx: &egui::Context) {
+    if ctx.input(|input| input.raw.hovered_files.is_empty()) {
+        return;
+    }
+    let layer = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("file_drop_target"),
+    );
+    let painter = ctx.layer_painter(layer);
+    let area = ctx.content_rect();
+    painter.rect_filled(area, 0.0, Color32::from_black_alpha(180));
+    painter.text(
+        area.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop the picture here",
+        egui::TextStyle::Heading.resolve(&ctx.global_style()),
+        Color32::WHITE,
+    );
+}
+
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.show(ui);
+
+        // The dialog is opened here and not in `show`, because it needs the window to be put in
+        // front of. The program waits for it, which is what a person choosing a file expects.
+        if std::mem::take(&mut self.pick_picture) {
+            let picked = rfd::FileDialog::new()
+                .set_title("Choose a picture for the label")
+                .add_filter(
+                    "Pictures",
+                    &[
+                        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp",
+                    ],
+                )
+                .add_filter("All files", &["*"])
+                .set_parent(&*frame)
+                .pick_file();
+            if let Some(path) = picked {
+                self.load_picture(path);
+            }
+        }
     }
 
     fn on_exit(&mut self) {
         self.remember();
     }
+}
+
+/// How many lines the window offers to split the text into. A label is 12 mm high, so more lines
+/// than this would hardly be readable.
+const MOST_LINES_OFFERED: usize = 3;
+
+/// What to tell the person about splitting the text, if there is something to say.
+fn lines_hint(lines: Lines, text: &str) -> Option<String> {
+    let Lines::Split(count) = lines else {
+        return None;
+    };
+    let words = text.split_whitespace().count();
+    if words == 0 {
+        None
+    } else if words < count {
+        // A word is never broken, so there are not as many lines as were asked for.
+        let plural = if words == 1 { "" } else { "s" };
+        Some(format!(
+            "Only {words} word{plural}, so just {words} line{plural}."
+        ))
+    } else {
+        Some("Split for you. New lines you type count as spaces.".to_string())
+    }
+}
+
+/// Puts `text` into `target` from character `selected.0` to character `selected.1` (the selection
+/// of a text box, which is where the cursor is when they are the same), or at the end if there is
+/// no cursor. Returns the character the cursor goes to: right after what was put in.
+fn insert_at_cursor(target: &mut String, selected: Option<(usize, usize)>, text: &str) -> usize {
+    let count = target.chars().count();
+    let (start, end) = selected.map_or((count, count), |(start, end)| {
+        (start.min(count), end.min(count))
+    });
+    let byte = |character: usize| {
+        target
+            .char_indices()
+            .nth(character)
+            .map_or(target.len(), |(byte, _)| byte)
+    };
+    let (from, to) = (byte(start), byte(end));
+    target.replace_range(from..to, text);
+    start + text.chars().count()
+}
+
+/// Lets the window draw the emoji that the labels do: the installed emoji font (Windows has a
+/// recent one) after the fonts the window has. Without it the window's own, older emoji font would
+/// show a box for the newer emoji, in the text box and in the picker, though the label has them.
+fn install_emoji_font(ctx: &egui::Context, fonts: &Fonts) {
+    let Some((bytes, index)) = fonts.installed_emoji_font() else {
+        return;
+    };
+    let mut data = egui::FontData::from_owned(bytes);
+    data.index = index;
+    let mut definitions = egui::FontDefinitions::default();
+    definitions
+        .font_data
+        .insert("installed-emoji".to_string(), Arc::new(data));
+    if let Some(proportional) = definitions
+        .families
+        .get_mut(&egui::FontFamily::Proportional)
+    {
+        // After the first font, which has the letters and digits, and before the others, so that
+        // an emoji is drawn the way the label draws it.
+        proportional.insert(1.min(proportional.len()), "installed-emoji".to_string());
+    }
+    ctx.set_fonts(definitions);
 }
 
 /// A number of blank rows that is either the default for the label stock or one the person set.
@@ -766,6 +1246,23 @@ mod tests {
 
     fn address(last_byte: u8) -> MacAddr6 {
         MacAddr6::new([2, 0, 0, 0, 0, last_byte])
+    }
+
+    #[test]
+    fn the_person_is_told_when_a_text_has_too_few_words_for_the_lines_asked_for() {
+        assert_eq!(lines_hint(Lines::AsTyped, "Kitchen pantry"), None);
+        assert_eq!(lines_hint(Lines::Split(2), "   "), None);
+        assert_eq!(
+            lines_hint(Lines::Split(2), "Hello").as_deref(),
+            Some("Only 1 word, so just 1 line.")
+        );
+        assert_eq!(
+            lines_hint(Lines::Split(3), "Hello\nthere").as_deref(),
+            Some("Only 2 words, so just 2 lines.")
+        );
+        assert!(lines_hint(Lines::Split(2), "Hello there you")
+            .unwrap()
+            .starts_with("Split for you"));
     }
 
     #[test]
@@ -855,7 +1352,17 @@ mod tests {
     }
 
     /// Lays the window out on a screen of this size, as egui would draw it, and returns the text.
-    fn lay_out(app: &mut App, [width, height]: [f32; 2]) -> Vec<Shown> {
+    fn lay_out(app: &mut App, size: [f32; 2]) -> Vec<Shown> {
+        lay_out_with(app, size, |_| {})
+    }
+
+    /// Like [`lay_out`], with something done to what egui is told about the world each frame
+    /// (a file held over the window, for instance).
+    fn lay_out_with(
+        app: &mut App,
+        [width, height]: [f32; 2],
+        adjust: impl Fn(&mut egui::RawInput),
+    ) -> Vec<Shown> {
         fn collect(shape: &egui::Shape, shown: &mut Vec<Shown>) {
             match shape {
                 egui::Shape::Text(text) => shown.push(Shown {
@@ -873,10 +1380,11 @@ mod tests {
         let mut shown = Vec::new();
         // Panels and the like find their sizes over a few frames, so keep what the last one drew.
         for _ in 0..3 {
-            let input = egui::RawInput {
+            let mut input = egui::RawInput {
                 screen_rect: Some(screen),
                 ..Default::default()
             };
+            adjust(&mut input);
             let output = context.run_ui(input, |ui| app.show(ui));
             shown.clear();
             for clipped in &output.shapes {
@@ -943,6 +1451,378 @@ mod tests {
         assert_fits(
             &mut app,
             "the window when connected, with an address typed in",
+        );
+    }
+
+    // ---- pictures ---------------------------------------------------------------------------
+
+    /// A folder of its own for the files a test makes, removed when it is dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("d30-gui-test-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        /// A PNG, black all over, `size` dots square.
+        fn black_picture(&self, name: &str, size: u32) -> PathBuf {
+            let path = self.0.join(name);
+            image::RgbaImage::from_pixel(size, size, image::Rgba([0, 0, 0, 255]))
+                .save(&path)
+                .unwrap();
+            path
+        }
+
+        fn broken_file(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"this is not a picture").unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file as egui hands it over when it is dropped on the window.
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn a_picture_dropped_on_the_window_goes_on_the_label() {
+        let dir = TempDir::new("dropped");
+        let path = dir.black_picture("jar.png", 20);
+        let mut app = test_app();
+        assert!(app.settings.picture.is_none());
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]),
+            )),
+            dropped_files: vec![Arc::new(Dropped(path.clone())) as egui::DroppedFileHandle],
+            ..Default::default()
+        };
+        context
+            .run_ui(input, |ui| app.show(ui))
+            .drop_without_applying_deltas();
+
+        let picture = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture is on the label");
+        assert_eq!(picture.path, path);
+        assert_eq!(
+            (picture.picture.width(), picture.picture.height()),
+            (20, 20)
+        );
+        assert!(app.picture_error.is_none());
+        // And the preview shows it: 66 dots square, from column 15 on a 12x40 label.
+        let Some(Ok(preview)) = &app.preview else {
+            panic!("the label should have been drawn");
+        };
+        let canvas = preview.rendered.canvas();
+        assert!(canvas.get_pixel(40, 48)[0] > 127);
+    }
+
+    #[test]
+    fn while_a_file_is_held_over_the_window_it_says_what_will_happen() {
+        let mut app = test_app();
+        let said = |shown: &[Shown]| {
+            shown
+                .iter()
+                .any(|text| text.text == "Drop the picture here")
+        };
+        assert!(!said(&lay_out(&mut app, WINDOW_SIZE)));
+        let held = lay_out_with(&mut app, WINDOW_SIZE, |input| {
+            input.hovered_files = vec![egui::HoveredFile::default()];
+        });
+        assert!(said(&held));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_picture_is_reported_and_the_label_is_left_alone() {
+        let dir = TempDir::new("broken");
+        let mut app = test_app();
+        app.load_picture(dir.broken_file("notes.png"));
+        assert!(app.settings.picture.is_none());
+        let error = app.picture_error.clone().expect("there is an error");
+        assert!(error.contains("notes.png"), "{error}");
+
+        // A picture that can be read clears the error.
+        app.load_picture(dir.black_picture("jar.png", 8));
+        assert!(app.settings.picture.is_some());
+        assert!(app.picture_error.is_none());
+
+        // And one that cannot be read does not take the picture away.
+        app.load_picture(dir.0.join("missing.png"));
+        assert!(app.settings.picture.is_some());
+        assert!(app.picture_error.is_some());
+    }
+
+    #[test]
+    fn another_picture_is_set_in_the_same_way_as_the_one_it_replaces() {
+        let dir = TempDir::new("replace");
+        let mut app = test_app();
+        app.load_picture(dir.black_picture("first.png", 8));
+        let first = app.settings.picture.clone().unwrap();
+        {
+            let picture = app.settings.picture.as_mut().unwrap();
+            picture.side = Side::Right;
+            picture.dither = true;
+            picture.invert = true;
+        }
+        app.load_picture(dir.black_picture("second.png", 12));
+        let second = app.settings.picture.as_ref().unwrap();
+        assert!(second.path.ends_with("second.png"));
+        assert_ne!(second.picture, first.picture);
+        assert_eq!((second.picture.width(), second.picture.height()), (12, 12));
+        assert_eq!(
+            (second.side, second.dither, second.invert),
+            (Side::Right, true, true)
+        );
+    }
+
+    #[test]
+    fn the_picture_settings_fit_the_smallest_window() {
+        let dir = TempDir::new("fits");
+        let mut app = test_app();
+        // A name that is long, as the names of files can be, and an error of a good length.
+        app.load_picture(dir.black_picture(
+            "a picture with a really quite long name for a file that holds a small jar.png",
+            16,
+        ));
+        assert_fits(&mut app, "the window with a picture");
+        app.settings.picture.as_mut().unwrap().fit_height = false;
+        assert_fits(&mut app, "the window with a picture of a chosen height");
+        app.picture_error = Some(
+            "Could not read the picture C:\\Users\\somebody\\Pictures\\a folder with a long name\\jar.png: \
+             the file is not a picture that this program can read"
+                .to_string(),
+        );
+        assert_fits(&mut app, "the window with an error about the picture");
+    }
+
+    #[test]
+    fn the_picture_command_line_options_load_it_and_set_it() {
+        let dir = TempDir::new("options");
+        let path = dir.black_picture("jar.png", 8);
+        let options = Options {
+            picture: Some(path.clone()),
+            picture_side: Some(Side::Right),
+            picture_dither: true,
+            picture_invert: true,
+            ..Default::default()
+        };
+        let app = App::assemble(
+            Saved::default(),
+            devices::Discovery::default(),
+            Fonts::embedded(),
+            Printer::start(Unreachable, 1, || {}),
+            options,
+        );
+        let picture = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture is loaded");
+        assert_eq!(picture.path, path);
+        assert_eq!(
+            (picture.side, picture.dither, picture.invert),
+            (Side::Right, true, true)
+        );
+    }
+
+    #[test]
+    fn the_picture_from_last_time_comes_back_if_its_file_is_still_there() {
+        let dir = TempDir::new("remembered");
+        let path = dir.black_picture("jar.png", 8);
+        let mut settings = LabelSettings::default();
+        let mut picture = PictureSettings::new(path.clone(), Picture::open(&path).unwrap());
+        picture.side = Side::Right;
+        picture.level = 99;
+        settings.picture = Some(picture);
+        let saved = Saved::new(&settings, None);
+
+        let assemble = |saved: Saved| {
+            App::assemble(
+                saved,
+                devices::Discovery::default(),
+                Fonts::embedded(),
+                Printer::start(Unreachable, 1, || {}),
+                Options::default(),
+            )
+        };
+        let app = assemble(saved.clone());
+        let back = app
+            .settings
+            .picture
+            .as_ref()
+            .expect("the picture comes back");
+        assert_eq!((back.side, back.level), (Side::Right, 99));
+        assert!(app.picture_error.is_none());
+
+        // Once the file is gone there is no picture, and the person is told why.
+        std::fs::remove_file(&path).unwrap();
+        let app = assemble(saved);
+        assert!(app.settings.picture.is_none());
+        assert!(app.picture_error.is_some());
+    }
+
+    // ---- emoji ------------------------------------------------------------------------------
+
+    #[test]
+    fn an_emoji_goes_where_the_cursor_is_or_in_place_of_what_is_selected() {
+        let put = |text: &str, selected: Option<(usize, usize)>| {
+            let mut text = text.to_string();
+            let cursor = insert_at_cursor(&mut text, selected, "🍎");
+            (text, cursor)
+        };
+        let result = |text: &str, cursor: usize| (text.to_string(), cursor);
+        assert_eq!(put("Hello world", Some((5, 5))), result("Hello🍎 world", 6));
+        assert_eq!(put("Hello world", Some((0, 0))), result("🍎Hello world", 1));
+        // What was selected makes way for it.
+        assert_eq!(put("Hello world", Some((6, 11))), result("Hello 🍎", 7));
+        // Without a cursor, at the end.
+        assert_eq!(put("Hello", None), result("Hello🍎", 6));
+        assert_eq!(put("", None), result("🍎", 1));
+        // A cursor that is past the end is at the end.
+        assert_eq!(put("Hi", Some((50, 60))), result("Hi🍎", 3));
+        // Places are characters, not bytes.
+        assert_eq!(put("é🍌x", Some((2, 2))), result("é🍌🍎x", 3));
+    }
+
+    #[test]
+    fn choosing_an_emoji_puts_it_in_the_text_box_at_its_cursor_and_the_cursor_after_it() {
+        let context = egui::Context::default();
+        let id = egui::Id::unique("label text");
+        let mut app = test_app();
+        app.settings.text = "Hello world".to_string();
+        let mut state = egui::TextEdit::load_state(&context, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(5),
+            )));
+        state.store(&context, id);
+
+        app.insert_into_text(&context, id, '🍎');
+        assert_eq!(app.settings.text, "Hello🍎 world");
+        let range = egui::TextEdit::load_state(&context, id)
+            .and_then(|state| state.cursor.char_range())
+            .expect("the cursor is kept");
+        assert_eq!(
+            (range.primary.index.0, range.secondary.index.0),
+            (6, 6),
+            "the cursor is right after the emoji"
+        );
+        // So the next one comes after the first.
+        app.insert_into_text(&context, id, '🥕');
+        assert_eq!(app.settings.text, "Hello🍎🥕 world");
+
+        // A text box that nobody has put the cursor in takes it at the end.
+        let mut fresh = test_app();
+        fresh.settings.text = "Pantry".to_string();
+        fresh.insert_into_text(&egui::Context::default(), id, '🫙');
+        assert_eq!(fresh.settings.text, "Pantry🫙");
+    }
+
+    /// The emoji of the list that are drawn as buttons in what `lay_out` returned.
+    fn emoji_buttons(shown: &[Shown]) -> Vec<char> {
+        shown
+            .iter()
+            .filter_map(|text| {
+                let mut characters = text.text.chars();
+                let symbol = characters.next()?;
+                characters.next().is_none().then_some(symbol)
+            })
+            .filter(|symbol| {
+                emoji::GROUPS
+                    .iter()
+                    .any(|group| group.emoji().any(|emoji| emoji.symbol == *symbol))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_emoji_picker_opens_and_offers_emoji_and_the_search_narrows_them_down() {
+        let mut app = test_app();
+        assert!(
+            emoji_buttons(&lay_out(&mut app, WINDOW_SIZE)).is_empty(),
+            "the picker is closed to begin with"
+        );
+
+        app.emoji.open_now = true;
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.len() > 50, "{} emoji offered", offered.len());
+        // (The buttons of the groups show an emoji each too, the apple for food and drink, so
+        // the emoji to look for are ones that are not those.)
+        assert!(offered.contains(&'🍌'));
+        assert!(!offered.contains(&'🐶'), "only the first group is shown");
+
+        // Another group.
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        app.emoji.group = 3;
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.contains(&'🐶') && !offered.contains(&'🍌'));
+
+        // A search looks through all of them, and the buttons of the groups are out of the way.
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        app.emoji.query = "apple".to_string();
+        let offered = emoji_buttons(&lay_out(&mut app, WINDOW_SIZE));
+        assert!(offered.contains(&'🍎') && offered.contains(&'🍏'));
+        assert!(offered.len() < 6, "{offered:?}");
+
+        app.emoji.query = "zzzzzz".to_string();
+        app.emoji.open_now = true;
+        let shown = lay_out(&mut app, WINDOW_SIZE);
+        assert!(emoji_buttons(&shown).is_empty());
+        assert!(shown.iter().any(|text| text.text == "Nothing like that."));
+    }
+
+    #[test]
+    fn the_open_emoji_picker_fits_the_smallest_window() {
+        let mut app = test_app();
+        app.emoji.open_now = true;
+        assert_fits(&mut app, "the window with the emoji picker open");
+    }
+
+    #[test]
+    fn an_emoji_in_the_text_is_on_the_label() {
+        let mut app = test_app();
+        app.settings.text = "🍎".to_string();
+        lay_out(&mut app, WINDOW_SIZE);
+        let Some(Ok(preview)) = &app.preview else {
+            panic!("the label should have been drawn");
+        };
+        let ink = preview
+            .rendered
+            .canvas()
+            .pixels()
+            .filter(|pixel| pixel[0] > 127)
+            .count();
+        assert!(
+            ink > 300,
+            "an apple is a big shape, but there are {ink} dots"
         );
     }
 }
