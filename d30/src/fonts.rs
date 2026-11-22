@@ -11,10 +11,12 @@ use crate::{CouldNotInitFontSnafu, CouldNotReadFontFileSnafu, D30Error};
 
 const EMBEDDED_FONT: &[u8] = include_bytes!("DejaVuSans.ttf");
 
-/// Noto Emoji (monochrome, version 1.05, SIL Open Font License, see `NotoEmoji-OFL.txt`). It is the
-/// last resort for emoji, which are black and white here, as a label printer prints them. It only has
-/// the emoji up to Unicode 7 or so; Windows has a much newer one (see below).
-const EMOJI_FONT: &[u8] = include_bytes!("NotoEmoji-Regular.ttf");
+/// Noto Emoji (the monochrome variable font, SIL Open Font License, see `NotoEmoji-OFL.txt`). It is
+/// the last resort for emoji, which are black and white here, as a label printer prints them, and
+/// it has nearly all of them (1,377 of the 1,400 that are one character), so that a computer
+/// without an emoji font of its own, a Linux one for instance, draws them too. The default weight
+/// is the one that is used.
+const EMOJI_FONT: &[u8] = include_bytes!("NotoEmoji.ttf");
 
 /// Installed fonts that have emoji, best first. They are drawn in black and white from the plain
 /// outlines that these fonts keep under their colors.
@@ -22,6 +24,12 @@ const EMOJI_FAMILIES: &[&str] = &["Segoe UI Emoji", "Noto Emoji"];
 
 /// The family name of the font that is built into the library.
 pub const EMBEDDED_FAMILY: &str = "DejaVu Sans";
+
+/// The emoji font that is built into the library, as the bytes of the font file, for a program that
+/// draws text itself and has no emoji font of the computer to show the same emoji with.
+pub fn bundled_emoji_font() -> &'static [u8] {
+    EMOJI_FONT
+}
 
 /// Where a font comes from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -143,8 +151,8 @@ impl Fonts {
 
     /// The fonts that draw what the font of a label has no glyph for, which is mostly emoji, in the
     /// order they are tried: the emoji fonts installed on this computer (Windows has a recent one),
-    /// then the small one built into the library, which knows the older emoji. The first time this
-    /// is asked for it reads them, which can take a moment.
+    /// then the one built into the library, which has nearly all of them. The first time this is
+    /// asked for it reads them, which can take a moment.
     pub fn fallbacks(&self) -> &[Font<'static>] {
         self.fallbacks.get_or_init(|| {
             let plain = FontSpec::default();
@@ -269,6 +277,17 @@ mod tests {
         // A file that exists is a file even if it has an unusual name.
         let here = FontSpec::parse(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fonts.rs"));
         assert!(matches!(here.source, FontSource::File(_)));
+    }
+
+    #[test]
+    fn the_built_in_emoji_font_has_nearly_every_emoji() {
+        let fonts = Fonts::embedded();
+        // The ones that the old built-in font (Unicode 7) did not have, from every age.
+        for emoji in ['🤡', '🦄', '🫠', '🪿', '🍎', '❤', '⚽'] {
+            assert!(fonts.fallback_draws(emoji), "{emoji}");
+        }
+        assert!(!fonts.fallback_draws('x'));
+        assert!(bundled_emoji_font().len() > 1_000_000);
     }
 
     #[test]

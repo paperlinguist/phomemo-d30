@@ -31,12 +31,10 @@ impl Write for RfcommStream {
     }
 }
 
-/// Not implemented on Linux yet: use `bluetoothctl devices` to see the paired devices.
+/// The devices that BlueZ has paired, asked of its `bluetoothctl` (which comes with it). An error,
+/// with what to do about it, if that is not installed or the Bluetooth service is not running.
 pub fn list_paired_devices() -> io::Result<Vec<PairedDevice>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "listing paired devices is not implemented on Linux yet; run `bluetoothctl devices` instead",
-    ))
+    super::bluetoothctl::list_paired_devices(&super::bluetoothctl::run_bluetoothctl)
 }
 
 /// Advice for when the printer never answers; `addr` is its address as `AA:BB:CC:DD:EE:FF`.

@@ -1670,15 +1670,15 @@ mod tests {
     }
 
     #[test]
-    fn what_the_built_in_font_can_draw_is_most_of_the_list_and_can_be_told_apart() {
-        // Without the installed fonts only the built-in emoji font draws them, and it is old.
+    fn what_the_built_in_font_can_draw_is_nearly_all_of_the_list_and_can_be_told_apart() {
+        // Without the installed fonts only the built-in emoji font draws them.
         let fonts = Fonts::embedded();
         let drawn = all()
             .into_iter()
             .filter(|emoji| fonts.fallback_draws(emoji.symbol))
             .count();
-        assert!(drawn > 500, "only {drawn} of the emoji can be drawn");
-        assert!(fonts.fallback_draws('🍎'));
+        assert!(drawn > 1300, "only {drawn} of the emoji can be drawn");
+        assert!(fonts.fallback_draws('🍎') && fonts.fallback_draws('🤡'));
         assert!(!fonts.fallback_draws('x'));
     }
 

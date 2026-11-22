@@ -592,6 +592,14 @@ impl App {
                     .arg("ms-settings:bluetooth")
                     .spawn();
             }
+            #[cfg(target_os = "linux")]
+            if ui
+                .button("Pair…")
+                .on_hover_text("Open the Bluetooth settings of this desktop, to pair the printer")
+                .clicked()
+            {
+                self.open_bluetooth_settings();
+            }
 
             ui.separator();
             self.connection_controls(ui);
@@ -604,6 +612,34 @@ impl App {
             );
         }
         ui.add_space(4.0);
+    }
+
+    /// Opens the Bluetooth settings of the desktop, which are a different program on each one: the
+    /// first of them that starts is used. If none does, the status says how to pair without them.
+    #[cfg(target_os = "linux")]
+    fn open_bluetooth_settings(&mut self) {
+        // The program and what to tell it, for GNOME, Blueman (many desktops), KDE Plasma 6 and 5.
+        const SETTINGS: &[(&str, &[&str])] = &[
+            ("gnome-control-center", &["bluetooth"]),
+            ("blueman-manager", &[]),
+            ("kcmshell6", &["kcm_bluetooth"]),
+            ("kcmshell5", &["kcm_bluetooth"]),
+        ];
+        for (program, arguments) in SETTINGS {
+            if let Ok(mut child) = std::process::Command::new(program).args(*arguments).spawn() {
+                // Nobody else is going to collect the program when it is closed.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return;
+            }
+        }
+        self.say(
+            Level::Info,
+            "No Bluetooth settings program was found. Pair the printer in a terminal: run \
+             `bluetoothctl`, then `scan on`, `pair AA:BB:CC:DD:EE:FF` and `trust AA:BB:CC:DD:EE:FF` \
+             with the printer's address, and press Refresh here.",
+        );
     }
 
     fn connection_controls(&mut self, ui: &mut egui::Ui) {
@@ -1281,14 +1317,18 @@ fn insert_at_cursor(target: &mut String, selected: Option<(usize, usize)>, text:
 }
 
 /// Lets the window draw the emoji that the labels do: the installed emoji font (Windows has a
-/// recent one) after the fonts the window has. Without it the window's own, older emoji font would
-/// show a box for the newer emoji, in the text box and in the picker, though the label has them.
+/// recent one), or else the one built into the library, after the fonts the window has. Without it
+/// the window's own, older emoji font would show a box for the newer emoji, in the text box and in
+/// the picker, though the label has them.
 fn install_emoji_font(ctx: &egui::Context, fonts: &Fonts) {
-    let Some((bytes, index)) = fonts.installed_emoji_font() else {
-        return;
+    let data = match fonts.installed_emoji_font() {
+        Some((bytes, index)) => {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = index;
+            data
+        }
+        None => egui::FontData::from_static(d30::fonts::bundled_emoji_font()),
     };
-    let mut data = egui::FontData::from_owned(bytes);
-    data.index = index;
     let mut definitions = egui::FontDefinitions::default();
     definitions
         .font_data

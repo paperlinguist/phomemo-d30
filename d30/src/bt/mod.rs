@@ -16,6 +16,11 @@
 
 use advmac::MacAddr6;
 
+// Listing the paired devices on Linux. It is built (for its tests) on any system, as it is only
+// logic and text.
+#[cfg(any(target_os = "linux", test))]
+mod bluetoothctl;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
