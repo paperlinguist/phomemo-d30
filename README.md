@@ -50,6 +50,40 @@ nix run github:crabdancing/phomemo-d30
 
 This will fetch dependencies, compile, and run the program all in one go.
 
+## CLI usage and the label designer (Linux)
+
+Both programs run on Linux, with BlueZ, the Bluetooth stack that nearly every distribution has. The command line program and the window do the same on Linux as on Windows: everything below "The label designer" and "Labels, fonts and uncut tape" applies.
+
+**1. What it needs.** BlueZ with its service running (`systemctl status bluetooth`), and for the window a desktop with Wayland or X11 and OpenGL or Vulkan drivers (Mesa will do). On Debian and Ubuntu that is `sudo apt install bluez libbluetooth3`. The file dialog of the window ("Choose a picture…") is the one of your desktop, through xdg-desktop-portal; dropping a file on the window works without it.
+
+**2. Get the programs.** Download `d30-linux-x86_64.tar.gz` from the `nightly` release on this repository's Releases page (it is rebuilt automatically whenever a pull request is merged) and unpack it: `tar -xzf d30-linux-x86_64.tar.gz`. It holds `d30-cli`, the command line program, and `d30-gui`, the label designer. It is built on Ubuntu 22.04, so it runs on that and on anything newer (Debian 12, Fedora, Arch, ...). To build them yourself instead: install [Rust](https://rustup.rs) and `libbluetooth-dev` (`bluez-libs-devel` on Fedora), and from a checkout of this repository run `cargo install --path cli` and `cargo install --path gui --locked`.
+
+**3. Pair the printer.** Switch it on and press **Pair…** in the window, which opens the Bluetooth settings of GNOME, KDE or Blueman. Or in a terminal:
+
+```sh
+bluetoothctl
+[bluetooth]# power on
+[bluetooth]# scan on          # wait until the D30 shows up, with its address
+[bluetooth]# pair AA:BB:CC:DD:EE:FF
+[bluetooth]# trust AA:BB:CC:DD:EE:FF
+[bluetooth]# quit
+```
+
+`bluetoothctl info AA:BB:CC:DD:EE:FF` should list a "Serial Port" service (UUID 00001101). If it does not, pair again.
+
+**4. Find the address and print.**
+
+```sh
+d30-cli list-printers                                    # the paired devices, the D30 pointed out
+d30-cli print-text "Hello" --device AA:BB:CC:DD:EE:FF    # a label
+d30-cli position-tape --device AA:BB:CC:DD:EE:FF         # for 14x30 labels, see below
+./d30-gui                                                # the label designer
+```
+
+Put the address in the config file (see below) to leave out `--device`. Only one program can use the printer at a time: close the window before you use the command line program.
+
+**What has been tried.** The Linux programs are built and tested on every change (the library, the command line program and the window's own tests, on Ubuntu), the command line program runs there without a printer, and a picture of the window on a virtual screen is made. They have not been tried against a real printer on Linux; the Bluetooth part there is the one of the original program, which worked on Linux, and the list of paired printers is new. If something does not work, `bluetoothctl info AA:BB:CC:DD:EE:FF` and the message the window shows are the first things to look at.
+
 ## CLI usage (Windows)
 
 The CLI runs natively on Windows 10 and 11. It talks to the printer through the Windows Bluetooth stack (an RFCOMM socket via Winsock), so no extra driver, COM port or WSL is needed.
@@ -80,7 +114,7 @@ The label preview (`--preview`) opens the image in Windows' default image viewer
 
 `d30-gui` is a window for making labels without the command line:
 
-* **Printer** (top): pick the printer from the Bluetooth devices your computer has paired (plus any printers named in the command line program's config file), then press **Connect**. The connection stays open, so printing starts at once; **Disconnect** frees the printer for other programs. **Pair…** opens Windows' Bluetooth settings, and **Refresh** looks again for paired printers. On Linux the list of paired devices is not available yet, so type the printer's address under "Other address…".
+* **Printer** (top): pick the printer from the Bluetooth devices your computer has paired (plus any printers named in the command line program's config file), then press **Connect**. The connection stays open, so printing starts at once; **Disconnect** frees the printer for other programs. **Pair…** opens the Bluetooth settings of Windows (or, on Linux, of your desktop: GNOME, KDE or Blueman), and **Refresh** looks again for paired printers. If the computer cannot say which devices are paired, the window says why, and the printer's address can be typed under "Other address…".
 * **Settings** (left): the text, the font with bold and italic, the size or "as large as fits", alignment, margin, a picture, and the kind of label or tape. For uncut tape you can cut the label to fit the text or give a length. For labels with a wide gap (14 × 30 mm) there is a **Position the tape** button, which sets the tape up for them: see "Labels with a wide gap" below.
   * **Emoji**: the "😀 Emoji" button next to "Text" opens a picker with about 1,400 emoji in groups (faces and hearts, people and hands, nature and animals, food and drink, travel and places, activities and music, home and things, office and tools, signs and symbols) and a search box that knows what they are called and other words for them ("clown", "carrot", "home", "heart"). The picker leaves out the few that your computer's fonts cannot draw. Clicking an emoji puts it into the text where the cursor is and leaves the picker open for the next one. Emoji are printed in black and white, with Segoe UI Emoji on Windows, so the label has every current emoji; they are drawn whatever font you chose for the letters.
   * **Lines**: "As typed" breaks the text only where you press Enter. Choosing 1, 2 or 3 makes the program split the text over that many lines for you, with the breaks where the longest line is shortest, so that the text can be as large as possible. A long text on uncut tape gets much shorter that way.
@@ -113,7 +147,7 @@ d30-cli print-text "Hello, tape!" --label 15-continuous   # uncut tape, cut to f
 * `--label` takes a name from `list-labels`, or any size: `12x35` is a precut label 12 mm wide and 35 mm long, and `13-continuous` is uncut tape 13 mm wide. The D30 prints a band 12 mm wide, so on wider tape (up to 15 mm) the text is centred with a margin on each side.
 * `\n` in the text starts a new line, and `--align` lines the lines up left, center or right.
 * `--lines 2` (or 3, up to 8) splits the text over that many lines for you, with the breaks where the longest line comes out shortest, which lets the text be as large as possible. Line breaks you typed then count as spaces. A word is never broken, so a text of two words has two lines at the most.
-* Emoji can be part of the text. When the font has no glyph for a character, an emoji font draws it, in black and white, which is how a label printer prints it. On Windows that is Segoe UI Emoji, which has all the current emoji; where it is missing, a small font built into the library draws the older ones. Skin tones and the characters that only choose the emoji form are left out, and emoji made of several (families, flags) come out as their parts.
+* Emoji can be part of the text. When the font has no glyph for a character, an emoji font draws it, in black and white, which is how a label printer prints it. On Windows that is Segoe UI Emoji, which has all the current emoji; where it is missing (on Linux, for instance), a font built into the library draws nearly all of them (the color emoji fonts of Linux cannot be used: they are pictures, not outlines). Skin tones and the characters that only choose the emoji form are left out, and emoji made of several (families, flags) come out as their parts.
 * `--picture FILE` puts a picture (PNG, JPEG, GIF, BMP, ICO, TIFF or WebP) at the left end of the label, or at the right with `--picture-side right`. It is as high as the label allows (less the margins), keeps its shape, and the text gets the room that is left. With an empty text (`""`) the picture is on its own, in the middle. On a label of a set length the pictures together take at most 60% of it, so that the text always has some room; uncut tape that is cut to fit just gets longer.
 * Colors become grays, and transparent parts are white, so a logo with a transparent background prints as the logo and not as a black square. Then the grays become dots: by default black where the picture is darker than half (`--picture-level` from 0 to 255 moves that), which suits drawings, logos and writing; `--picture-dither` makes patterns of dots instead, which suits photographs. `--picture-invert` swaps black and white (for a white logo on a dark background), and `--picture-height 6` makes the picture 6 mm high.
 * `--qr TEXT` puts a QR code of a link or some text beside the text, at the left end of the label or (`--qr-side right`) at the right end. `--wifi NAME` makes one for a Wi-Fi network instead, with `--wifi-password`, `--wifi-security wpa|wep|none` (`wpa` is also for WPA2 and WPA3) and `--wifi-hidden`; a phone that reads it offers to join the network. The code is as large as the label allows (on 12 mm tape a typical Wi-Fi code has squares of 3 dots, 0.4 mm) with every square a whole number of dots, and is never made smaller to make room: if there is too much for a code on the label you get an error saying so. `--qr-level low|medium|quartile|high` is how much of the code can be lost and still be read. `low`, the default, has the fewest squares. A password on the command line stays in the history of the shell, which the window does not do.

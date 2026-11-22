@@ -1,0 +1,234 @@
+name: Build and release
+
+on:
+  # Merging a pull request is a push to master: build, test and publish the "nightly" release.
+  push:
+    branches: [master]
+  # Pull requests only build and test, so a broken build is caught before it is merged.
+  pull_request:
+  # Allows running it by hand from the Actions tab (it only publishes when run on master).
+  workflow_dispatch:
+
+concurrency:
+  # Builds of master run one after another, so the newest merge always ends up as the published
+  # release. A newer push to a pull request cancels that pull request's older, now pointless run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # Link the C runtime into the exe, so that it runs on a fresh Windows without the
+      # "Visual C++ Redistributable" installed.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Rust (with the MSVC toolchain) comes preinstalled on the runner image.
+
+      # The GUI is a workspace of its own (see gui/Cargo.toml) and its libraries take several
+      # minutes to build, so what has been built is kept for the next run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gui -> target
+
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p d30 -p d30-cli
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p d30-cli
+
+      # In release mode, so that the tests and the build that follows share one compile.
+      - name: Test the GUI
+        working-directory: gui
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build the GUI
+        working-directory: gui
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      # The GUI is not run here: there is no screen on the runner.
+      - name: Smoke test the command line program
+        run: ./target/x86_64-pc-windows-msvc/release/d30-cli.exe --version
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = 'd30-windows-x86_64'
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/d30-cli.exe, gui/target/x86_64-pc-windows-msvc/release/d30-gui.exe, README.md, LICENSE -Destination "dist/$name"
+          # Windows' own bsdtar writes a normal zip (forward slashes, one top-level folder). The
+          # PowerShell zip commands do not reliably do that. The full path avoids GNU tar from Git,
+          # which cannot write zip files.
+          & "$env:SystemRoot\System32\tar.exe" -a -c -f "dist/$name.zip" -C dist $name
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          # A single line with a plain LF ending, so that `sha256sum -c` also works on Linux and macOS.
+          "$hash  $name.zip`n" | Set-Content -Path "dist/$name.zip.sha256" -Encoding ascii -NoNewline
+
+      # Pull requests get the package too, so a reviewer can try the build before merging.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-package
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    name: Build and test (Linux)
+    # The oldest runner image there is, because a program built on a newer Linux does not start on
+    # an older one (it needs a newer C library): this one runs on Ubuntu 22.04, Debian 12 and later.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # libbluetooth is what the link to the printer is built with, and bluez has `bluetoothctl`,
+      # which lists the paired printers. The rest lets the window start on a virtual screen, with
+      # software drawing, to take a picture of it.
+      - name: Install what is needed to build and to try the program
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libbluetooth-dev bluez \
+            xvfb libxkbcommon-x11-0 libwayland-client0 libgl1 libegl1 libgl1-mesa-dri \
+            libvulkan1 mesa-vulkan-drivers fonts-dejavu-core
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gui -> target
+
+      - name: Test
+        run: cargo test --locked -p d30 -p d30-cli
+
+      - name: Build
+        run: cargo build --release --locked -p d30-cli
+
+      # In release mode, so that the tests and the build that follows share one compile.
+      - name: Test the GUI
+        working-directory: gui
+        run: cargo test --release --locked
+
+      - name: Build the GUI
+        working-directory: gui
+        run: cargo build --release --locked
+
+      # Everything of the command line program that does not need a printer.
+      - name: Smoke test the command line program
+        run: |
+          cli=./target/release/d30-cli
+          "$cli" --version
+          "$cli" list-labels | grep -q 14x30
+          "$cli" list-fonts | head -3
+          "$cli" print-text "Guest Wi-Fi" --label 14x30 --wifi Guest --wifi-password tea-and-biscuits \
+            --dry-run --device AA:BB:CC:DD:EE:FF --save-image "$RUNNER_TEMP/wifi-label.png"
+          test -s "$RUNNER_TEMP/wifi-label.png"
+          "$cli" position-tape --dry-run --device AA:BB:CC:DD:EE:FF
+          # The runner has no Bluetooth adapter, so there is nothing to list. It has to say so, and
+          # not fall over.
+          out=$("$cli" list-printers 2>&1) || true
+          echo "$out"
+          if echo "$out" | grep -qi "panicked"; then exit 1; fi
+
+      # The window on a virtual screen, to see that it starts and what it looks like. A picture of it
+      # goes with the build, for a reviewer. This does not fail the build: whether a runner can draw
+      # a window depends on its graphics software.
+      - name: Take a picture of the window
+        continue-on-error: true
+        run: |
+          mkdir -p dist/screenshot
+          xvfb-run -a -s "-screen 0 1280x800x24" ./gui/target/release/d30-gui \
+            --label 14x30 --text "Guest Wi-Fi" --wifi Guest --wifi-password tea-and-biscuits \
+            --screenshot dist/screenshot/linux-window.png
+          ls -l dist/screenshot
+
+      - name: Package
+        run: |
+          name=d30-linux-x86_64
+          mkdir -p "dist/$name"
+          cp target/release/d30-cli gui/target/release/d30-gui README.md LICENSE "dist/$name/"
+          strip "dist/$name/d30-cli" "dist/$name/d30-gui"
+          tar --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -l dist
+
+      # Pull requests get the package too, so a reviewer can try the build before merging.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-package
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-window-picture
+          path: dist/screenshot/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish the nightly release
+    needs: [windows, linux]
+    # Only builds of master are published, never pull requests or other branches.
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Needed to create the release and its tag. Nothing from the repository is checked out or
+      # built in this job; it only handles the finished package from the build job.
+      contents: write
+    steps:
+      # Both packages, with their checksums, into one folder.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "*-package"
+          merge-multiple: true
+          path: dist
+
+      # "nightly" is a single rolling release: each merge deletes the previous one and publishes the
+      # new build in its place, so it always holds the latest master.
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          Builds of the master branch at commit ${GITHUB_SHA::7}, rebuilt automatically whenever a pull request is merged.
+
+          **Windows (x64):** d30-windows-x86_64.zip. Unzip it. d30-gui.exe is the label designer (double-click it); d30-cli.exe is the command line program.
+
+          **Linux (x86_64):** d30-linux-x86_64.tar.gz. Unpack it with \`tar -xzf\`. d30-gui is the label designer; d30-cli is the command line program. It needs BlueZ (the Bluetooth service, with libbluetooth3) and runs on Ubuntu 22.04, Debian 12 or later.
+
+          The README explains how to pair the printer. Each .sha256 file holds the checksum of the file with its name.
+          EOF
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release delete nightly --cleanup-tag --yes
+          fi
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest master (Windows and Linux)" \
+            --notes-file notes.md
