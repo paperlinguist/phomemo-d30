@@ -123,10 +123,12 @@ const fn continuous(
 /// 7 mm (roughly 55 rows).
 pub const HEAD_TO_TEAR_MM: f32 = 7.0;
 
-/// Where the printer's own label sensing leaves the print head when a print in gap mode is done: about
-/// 0.6 mm past the back edge of the label it printed, at the start of the gap. Measured on 14 × 30 mm
-/// labels, and the same after every print.
-pub const GAP_MODE_PARK_MM: f32 = 0.6;
+/// Where the printer's own label sensing leaves the print head when a print in gap mode is done, as
+/// the program counts it: 1.3 mm past the back edge of the label it printed, at the start of the gap.
+/// The first row of a print is seen to land about 0.6 mm past that edge, but with 0.6 the first label
+/// after positioning the tape came out 0.7 mm too far toward its front, and 1.3 is what centers it.
+/// Measured on 14 × 30 mm labels, and the same after every print.
+pub const GAP_MODE_PARK_MM: f32 = 1.3;
 
 /// How the rows of one label go onto the tape: what the printer is told about the stock, how many
 /// rows of the label to leave out, and how many blank rows come before and after it. See
@@ -171,12 +173,14 @@ pub static STOCKS: &[LabelStock] = &[
     precut("12x40", "12 × 40 mm precut labels", 12.0, 40.0, None, true),
     precut("12x30", "12 × 30 mm precut labels", 12.0, 30.0, None, false),
     precut("14x40", "14 × 40 mm precut labels", 14.0, 40.0, None, false),
-    // The gap is 8 mm on the labels it was tried with, which the program counts itself.
+    // Measured on the labels it was tried with: 30.2 mm long with a gap of 8 mm between them, which
+    // the program counts itself (so the 0.2 mm count: 38.2 mm from one label to the next, which is
+    // what a print has to be long, or the labels drift by 0.2 mm each).
     precut(
         "14x30",
         "14 × 30 mm precut labels",
         14.0,
-        30.0,
+        30.2,
         Some(8.0),
         true,
     ),
@@ -260,7 +264,7 @@ impl LabelStock {
     /// printer finds the gap for by itself, and then parks the head at the start of the gap, see
     /// [`GAP_MODE_PARK_MM`]) to leave the tape where the program expects it when it counts the rows:
     /// the middle of the gap at the tear edge. That is the gap, what the printer parks beyond the
-    /// label, and the rows that cannot be printed: 8 + 0.6 mm and 3 mm, 93 rows, for the 14 × 30 mm
+    /// label, and the rows that cannot be printed: 8 + 1.3 mm and 3 mm, 98 rows, for the 14 × 30 mm
     /// labels. `0` for stocks that are not counted.
     pub fn position_feed_rows(&self) -> usize {
         self.counted_gap_mm().map_or(0, |gap| {
@@ -291,7 +295,7 @@ impl LabelStock {
     /// behind the label before, about 9 mm ahead of the label for the 14 × 30 mm labels, and stops
     /// it when the label is over, so that the last 8 mm of the label cannot be printed. So these
     /// labels, whose gap is known, are printed as if they were uncut tape and the program keeps
-    /// count. A print is exactly one label plus its gap long, 38 mm (304 rows) for the 14 × 30 mm
+    /// count. A print is exactly one label plus its gap long, 38.2 mm (306 rows) for the 14 × 30 mm
     /// labels, and it ends with the middle of the gap, where the cut line is, at the tear edge.
     /// The tape is torn there, which is where the next print starts: the print head then is
     /// [`LabelStock::dead_front_rows`] into the label, which is why those rows are left out.
@@ -545,19 +549,21 @@ mod tests {
             }
         );
 
-        // Getting there from where the printer parks the head after a blank label (8 + 0.6 mm
-        // past the label, then the 24 rows that cannot be printed): 69 + 24 = 93 rows.
-        assert_eq!(stock.position_feed_rows(), 93);
+        // Getting there from where the printer parks the head after a blank label (8 + 1.3 mm
+        // past the label, then the 24 rows that cannot be printed): 74 + 24 = 98 rows.
+        assert_eq!(stock.position_feed_rows(), 98);
         assert_eq!(LabelStock::parse("12x40").unwrap().position_feed_rows(), 0);
 
-        // One print is one label plus its gap long (30 + 8 mm = 304 rows), so that the next print
-        // starts where this one ends, in step with the labels.
+        // One print is one label plus its gap long (30.2 + 8 mm = 306 rows), so that the next
+        // print starts where this one ends, in step with the labels.
         let plan = stock.tape_plan(None, None, None);
         let label_rows = stock.length_dots().unwrap() as usize;
+        assert_eq!(label_rows, 242);
         assert_eq!(
             label_rows - plan.skip_rows + plan.lead_rows + plan.feed_rows,
-            mm_to_dots(30.0 + 8.0) as usize
+            mm_to_dots(30.2 + 8.0) as usize
         );
+        assert_eq!(mm_to_dots(30.2 + 8.0), 306);
 
         // The head must not be further into the label than the tear edge leaves it: the rows that
         // cannot be printed are fewer than the rows of the label.

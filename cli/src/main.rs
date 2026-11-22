@@ -533,7 +533,6 @@ fn cmd_position_tape(config: &mut Config, args: &ArgsPositionTape) -> Result<(),
         });
     };
 
-    let mut socket = connect_with_retries(addr, args.max_retries, dry_run);
     let mut job = &first;
     loop {
         println!(
@@ -544,7 +543,11 @@ fn cmd_position_tape(config: &mut Config, args: &ArgsPositionTape) -> Result<(),
                 "Moving the tape on to the middle of the gap..."
             }
         );
+        // Each job goes over a connection of its own: the printer did not move the tape for a job
+        // that followed the blank label over the same connection, while it does on a fresh one.
+        let mut socket = connect_with_retries(addr, args.max_retries, dry_run);
         send_job(&mut socket, job)?;
+        drop(socket);
         let Some((pause, next)) = &job.then else {
             break;
         };

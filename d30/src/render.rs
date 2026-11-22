@@ -1848,7 +1848,7 @@ mod tests {
 
     // ---- labels whose front cannot be printed (the 14 x 30 mm labels) ---------------------------
 
-    /// How far from each end of the 14 x 30 mm label (240 dots) the content has to stay.
+    /// How far from each end of the 14 x 30 mm label (242 dots) the content has to stay.
     const KEEP_CLEAR: u32 = 24;
 
     #[test]
@@ -1861,7 +1861,7 @@ mod tests {
                 let (first, last) = ink_columns(&draw_label(&label)).unwrap();
                 assert!(first >= KEEP_CLEAR, "{text:?} margin {margin}: from {first}");
                 assert!(
-                    last < 240 - KEEP_CLEAR,
+                    last < 242 - KEEP_CLEAR,
                     "{text:?} margin {margin}: to {last}"
                 );
             }
@@ -1873,7 +1873,7 @@ mod tests {
         let mut label = Label::text(stock("14x30"), "Hello");
         text_mut(&mut label).margin = 40.0;
         let (first, last) = ink_columns(&draw_label(&label)).unwrap();
-        assert!(first >= 40 - 1 && last < 240 - 40 + 1, "{first} {last}");
+        assert!(first >= 40 - 1 && last < 242 - 40 + 1, "{first} {last}");
     }
 
     #[test]
@@ -1898,7 +1898,7 @@ mod tests {
                 vec![picture_element(black(400, 40), Side::Left, margin)],
             );
             let (first, last) = ink_columns(&draw_label(&alone)).unwrap();
-            assert!(first >= KEEP_CLEAR && last < 240 - KEEP_CLEAR, "{first} {last}");
+            assert!(first >= KEEP_CLEAR && last < 242 - KEEP_CLEAR, "{first} {last}");
 
             let beside_text = text_and_pictures(
                 "14x30",
@@ -1909,7 +1909,7 @@ mod tests {
                 ],
             );
             let (first, last) = ink_columns(&draw_label(&beside_text)).unwrap();
-            assert!(first >= KEEP_CLEAR && last < 240 - KEEP_CLEAR, "{first} {last}");
+            assert!(first >= KEEP_CLEAR && last < 242 - KEEP_CLEAR, "{first} {last}");
         }
     }
 
@@ -1921,13 +1921,13 @@ mod tests {
         let all = rendered.raster().unwrap();
         let raster = rendered.raster_for(&plan).unwrap();
 
-        // 30 mm of label and 8 mm of gap, 8 rows to the millimetre.
-        assert_eq!(all.rows(), 240);
-        assert_eq!(raster.rows(), 304);
-        // The label's rows start 24 rows in, and the rest of the 304 are blank.
+        // 30.2 mm of label and 8 mm of gap, 8 rows to the millimetre.
+        assert_eq!(all.rows(), 242);
+        assert_eq!(raster.rows(), 306);
+        // The label's rows start 24 rows in, and the rest of the 306 are blank.
         let row = all.width_bytes();
-        assert_eq!(&raster.bytes()[..216 * row], &all.bytes()[24 * row..]);
-        assert!(raster.bytes()[216 * row..].iter().all(|byte| *byte == 0));
+        assert_eq!(&raster.bytes()[..218 * row], &all.bytes()[24 * row..]);
+        assert!(raster.bytes()[218 * row..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

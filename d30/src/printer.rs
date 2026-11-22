@@ -242,6 +242,10 @@ impl<T: Transport, W: Fn()> Worker<T, W> {
             match &step.then {
                 Some((pause, next)) => {
                     thread::sleep(*pause);
+                    // The next job goes over a connection of its own: a printer that was sent a
+                    // blank label and then, over the same connection, the rest, did not move the
+                    // tape for the rest, while it does for a job sent on a fresh connection.
+                    self.link = None;
                     step = next;
                 }
                 None => break,
@@ -659,32 +663,37 @@ mod tests {
         });
 
         let events = events_until(&printer, is_end_of_print);
+        // Each job goes over a connection of its own, and there is one report at the end.
         assert_eq!(
             events,
             [
                 Event::Connecting { attempt: 1, of: 3 },
                 Event::Connected(address()),
                 Event::Printing { copy: 1, of: 1 },
+                Event::Connecting { attempt: 1, of: 3 },
+                Event::Connected(address()),
                 Event::Printing { copy: 1, of: 1 },
                 Event::Printed { copies: 1 },
             ]
         );
-        // The init of each job comes before its picture, in order, over the one connection.
+        // The init of each job comes before its picture, in order.
         let mut expected = expected_bytes(&first);
         expected.extend(expected_bytes(&second));
         let state = fake.state.lock().unwrap();
         assert_eq!(state.sent, expected);
-        assert_eq!(state.connects, 1);
+        assert_eq!(state.connects, 2);
     }
 
     #[test]
     fn when_the_second_job_fails_halfway_it_is_not_sent_again_and_nothing_is_reported_as_printed() {
         let fake = Fake::default();
-        // The first job is 3 writes (init and two parts of the picture), so write 5 is the first
-        // part of the picture of the second.
-        fake.state.lock().unwrap().fail_write = Some(5);
+        // Every connection fails its third write. The first job is short, an init and one part of
+        // a picture, so it gets through; the second is an init and two parts, and fails at the
+        // second part.
+        fake.state.lock().unwrap().fail_write = Some(3);
         let printer = start(&fake);
         let mut first = job(1);
+        first.raster = Raster::blank(100).unwrap();
         first.then = Some((Duration::ZERO, Box::new(job(1))));
         printer.send(Command::Print {
             address: address(),
@@ -696,7 +705,8 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, Event::Printed { .. })));
-        assert_eq!(fake.state.lock().unwrap().connects, 1);
+        // One connection for each of the two jobs, and the half-sent one is not sent again.
+        assert_eq!(fake.state.lock().unwrap().connects, 2);
     }
 
     #[test]
@@ -705,14 +715,14 @@ mod tests {
         let first = position_tape(&stock).expect("the 14 x 30 mm labels are counted");
         // A whole label of nothing, in the printer's own gap mode, so that it finds the gap.
         assert_eq!(first.media, Media::Gap);
-        assert_eq!(first.raster.rows(), 240);
+        assert_eq!(first.raster.rows(), 242);
         assert!(first.raster.bytes().iter().all(|byte| *byte == 0));
         assert_eq!(first.copies, 1);
         // Then, after it has had time to settle, the feed to the middle of the gap, as uncut tape.
         let (pause, second) = first.then.as_ref().expect("there is a second step");
         assert_eq!(*pause, SETTLE);
         assert_eq!(second.media, Media::Continuous);
-        assert_eq!(second.raster.rows(), 93);
+        assert_eq!(second.raster.rows(), 98);
         assert!(second.raster.bytes().iter().all(|byte| *byte == 0));
         assert!(second.then.is_none());
 
