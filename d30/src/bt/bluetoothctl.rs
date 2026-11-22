@@ -23,9 +23,11 @@ use advmac::{MacAddr6, MacAddrFormat};
 
 use super::PairedDevice;
 
-/// How long `bluetoothctl` is given to answer. It answers at once unless the Bluetooth service is
-/// stuck, and a window must not wait for ever on that.
-const TIMEOUT: Duration = Duration::from_secs(8);
+/// How long `bluetoothctl` is given to answer. It answers at once when the Bluetooth service is
+/// running, and waits for it to appear when it is not (a computer without a Bluetooth adapter does
+/// not start it), and the window, which lists the devices when it opens, must not wait for long on
+/// that.
+const TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Runs `bluetoothctl` with these arguments and returns what it printed.
 pub type Run<'a> = &'a dyn Fn(&[&str]) -> io::Result<String>;
