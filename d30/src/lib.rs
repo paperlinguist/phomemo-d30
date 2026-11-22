@@ -21,6 +21,7 @@ pub mod fonts;
 pub mod picture;
 pub mod printer;
 pub mod protocol;
+pub mod qr;
 pub mod render;
 pub mod stock;
 

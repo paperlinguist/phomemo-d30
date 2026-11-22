@@ -40,6 +40,8 @@ fn main() -> eframe::Result {
 /// The options for trying things out: `--screenshot FILE` saves a picture of the window and closes
 /// it, and `--text`, `--lines`, `--label` and `--font` start with those chosen. So does
 /// `--picture FILE`, with `--picture-side left|right`, `--picture-dither` and `--picture-invert`.
+/// `--qr TEXT` puts a QR code of a link or text on the label, and `--wifi NAME` with
+/// `--wifi-password PASSWORD` one of a Wi-Fi network (`--qr-side left|right` says where).
 /// `--emoji` opens the emoji picker.
 fn options_from_args() -> Options {
     let mut options = Options::default();
@@ -55,6 +57,10 @@ fn options_from_args() -> Options {
             }
             "--picture-dither" => options.picture_dither = true,
             "--picture-invert" => options.picture_invert = true,
+            "--qr" => options.qr = args.next(),
+            "--qr-side" => options.qr_side = args.next().and_then(|side| side.parse().ok()),
+            "--wifi" => options.wifi = args.next(),
+            "--wifi-password" => options.wifi_password = args.next(),
             "--emoji" => options.emoji = true,
             "--label" => options.label = args.next(),
             "--font" => options.font = args.next(),

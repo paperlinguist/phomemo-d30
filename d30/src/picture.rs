@@ -111,12 +111,14 @@ impl Picture {
     /// The picture as dots at the size it gets on the label: 255 where the printer burns, 0
     /// elsewhere. `invert` swaps black and white first.
     pub(crate) fn dots(&self, width: u32, height: u32, tone: Tone, invert: bool) -> GrayImage {
-        let mut gray = imageops::resize(
-            &*self.gray,
-            width.max(1),
-            height.max(1),
-            FilterType::Lanczos3,
-        );
+        let (width, height) = (width.max(1), height.max(1));
+        // At its own size the picture is left as it is: a QR code is made of squares of whole
+        // dots, and resampling it, however gently, could blur their edges.
+        let mut gray = if (width, height) == (self.gray.width(), self.gray.height()) {
+            (*self.gray).clone()
+        } else {
+            imageops::resize(&*self.gray, width, height, FilterType::Lanczos3)
+        };
         if invert {
             imageops::invert(&mut gray);
         }

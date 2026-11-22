@@ -5,7 +5,8 @@ use std::{fs, io, path::PathBuf, str::FromStr};
 use d30::{
     fonts::{FontSource, FontSpec},
     picture::{Picture, Tone},
-    render::{Align, Element, Label, Lines, PictureElement, Side, TextElement},
+    qr::{QrLevel, WifiNetwork, WifiSecurity},
+    render::{Align, Element, Label, Lines, PictureElement, QrElement, Side, TextElement},
     stock::{LabelStock, TapePlan, DEFAULT_STOCK_ID},
     D30Scale,
 };
@@ -39,6 +40,8 @@ pub struct LabelSettings {
     pub margin: f32,
     /// A picture on the label, if there is one.
     pub picture: Option<PictureSettings>,
+    /// A QR code on the label, if it is to have one.
+    pub qr: QrSettings,
     /// Blank rows to print before and after a label, or `None` for what suits the label stock.
     pub lead_in: Option<usize>,
     pub feed: Option<usize>,
@@ -62,6 +65,7 @@ impl Default for LabelSettings {
             align: Align::Center,
             margin: 15.0,
             picture: None,
+            qr: QrSettings::default(),
             lead_in: None,
             feed: None,
             copies: 1,
@@ -111,6 +115,12 @@ impl LabelSettings {
                 .elements
                 .push(Element::Picture(picture.element(self.margin)));
         }
+        if let Some(problem) = self.qr.problem() {
+            return Err(problem);
+        }
+        if let Some(qr) = self.qr.element() {
+            label.elements.push(Element::Qr(qr));
+        }
         Ok(label)
     }
 
@@ -118,6 +128,104 @@ impl LabelSettings {
     /// was set, or what the stock needs.
     pub fn tape_plan(&self, stock: &LabelStock) -> TapePlan {
         stock.tape_plan(None, self.lead_in, self.feed)
+    }
+}
+
+/// What a QR code on the label says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QrKind {
+    /// There is no QR code.
+    #[default]
+    Off,
+    /// The details of a Wi-Fi network, which a phone that reads the code offers to join.
+    Wifi,
+    /// A link or some text.
+    Text,
+}
+
+impl QrKind {
+    pub const ALL: [QrKind; 3] = [QrKind::Off, QrKind::Wifi, QrKind::Text];
+
+    /// What to call it in a list.
+    pub const fn name(self) -> &'static str {
+        match self {
+            QrKind::Off => "No QR code",
+            QrKind::Wifi => "Wi-Fi network",
+            QrKind::Text => "Link or text",
+        }
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            QrKind::Off => "off",
+            QrKind::Wifi => "wifi",
+            QrKind::Text => "text",
+        }
+    }
+}
+
+impl FromStr for QrKind {
+    type Err = ();
+
+    fn from_str(word: &str) -> Result<Self, ()> {
+        QrKind::ALL
+            .into_iter()
+            .find(|kind| kind.word() == word)
+            .ok_or(())
+    }
+}
+
+/// A QR code on the label and what it says.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QrSettings {
+    pub kind: QrKind,
+    /// For a link or text: what is in the code.
+    pub text: String,
+    /// For a Wi-Fi network: its details.
+    pub wifi: WifiNetwork,
+    /// Which end of the label it is at.
+    pub side: Side,
+    pub level: QrLevel,
+}
+
+impl QrSettings {
+    /// What is in the code, if it is to have one.
+    pub fn content(&self) -> Option<String> {
+        match self.kind {
+            QrKind::Off => None,
+            QrKind::Text => Some(self.text.clone()),
+            QrKind::Wifi => Some(self.wifi.payload()),
+        }
+    }
+
+    /// What is missing from a code that is wanted, as a sentence to show, or `None` if it is fine.
+    pub fn problem(&self) -> Option<String> {
+        match self.kind {
+            QrKind::Off => None,
+            QrKind::Text if self.text.trim().is_empty() => {
+                Some("Type a link or some text for the QR code, or choose No QR code.".to_string())
+            }
+            QrKind::Wifi if self.wifi.name.is_empty() => {
+                Some("Type the name of the Wi-Fi network for the QR code.".to_string())
+            }
+            QrKind::Wifi
+                if self.wifi.security != WifiSecurity::None && self.wifi.password.is_empty() =>
+            {
+                Some(
+                    "Type the password of the Wi-Fi network, or choose None (open) if it has none."
+                        .to_string(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The code as an element of a label.
+    fn element(&self) -> Option<QrElement> {
+        let mut element = QrElement::new(self.content()?);
+        element.side = self.side;
+        element.level = self.level;
+        Some(element)
     }
 }
 
@@ -228,6 +336,67 @@ impl SavedPicture {
     }
 }
 
+/// What is remembered of the QR code: not the password of a Wi-Fi network, which would end up as
+/// plain text in a file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedQr {
+    pub kind: Option<String>,
+    pub text: Option<String>,
+    pub wifi_name: Option<String>,
+    pub wifi_security: Option<String>,
+    pub wifi_hidden: Option<bool>,
+    pub side: Option<String>,
+    pub level: Option<String>,
+}
+
+impl SavedQr {
+    fn new(qr: &QrSettings) -> Self {
+        SavedQr {
+            kind: Some(qr.kind.word().to_string()),
+            text: Some(qr.text.clone()),
+            wifi_name: Some(qr.wifi.name.clone()),
+            wifi_security: Some(qr.wifi.security.word().to_string()),
+            wifi_hidden: Some(qr.wifi.hidden),
+            side: Some(side_name(qr.side).to_string()),
+            level: Some(qr.level.name().to_string()),
+        }
+    }
+
+    /// The QR code settings, from the defaults with what was remembered on top.
+    fn settings(&self) -> QrSettings {
+        let mut settings = QrSettings::default();
+        if let Some(kind) = self.kind.as_deref().and_then(|word| word.parse().ok()) {
+            settings.kind = kind;
+        }
+        if let Some(text) = &self.text {
+            settings.text = text.clone();
+        }
+        if let Some(name) = &self.wifi_name {
+            settings.wifi.name = name.clone();
+        }
+        if let Some(security) = self
+            .wifi_security
+            .as_deref()
+            .and_then(|word| word.parse().ok())
+        {
+            settings.wifi.security = security;
+        }
+        settings.wifi.hidden = self.wifi_hidden.unwrap_or(settings.wifi.hidden);
+        if let Some(side) = self
+            .side
+            .as_deref()
+            .and_then(|name| Side::from_str(name).ok())
+        {
+            settings.side = side;
+        }
+        if let Some(level) = self.level.as_deref().and_then(|name| name.parse().ok()) {
+            settings.level = level;
+        }
+        settings
+    }
+}
+
 /// What is remembered from one run to the next.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -245,9 +414,10 @@ pub struct Saved {
     pub align: Option<String>,
     pub margin: Option<f32>,
     pub copies: Option<u32>,
-    /// The picture on the label. It is the last field because it is a table in the file, and a
-    /// table cannot be followed by plain values.
+    /// The picture and the QR code on the label. They come last because they are tables in the
+    /// file, and a table cannot be followed by plain values.
     pub picture: Option<SavedPicture>,
+    pub qr: Option<SavedQr>,
 }
 
 impl Saved {
@@ -268,6 +438,7 @@ impl Saved {
             margin: Some(settings.margin),
             copies: Some(settings.copies),
             picture: settings.picture.as_ref().and_then(SavedPicture::new),
+            qr: Some(SavedQr::new(&settings.qr)),
         }
     }
 
@@ -304,6 +475,9 @@ impl Saved {
         }
         if let Some(copies) = self.copies {
             settings.copies = copies.clamp(1, 99);
+        }
+        if let Some(qr) = &self.qr {
+            settings.qr = qr.settings();
         }
         settings
     }
@@ -639,5 +813,134 @@ mod tests {
         // A copy count that makes no sense is brought back into range.
         let silly: Saved = toml::from_str("copies = 500").unwrap();
         assert_eq!(silly.settings().copies, 99);
+    }
+
+    // ---- the QR code ---------------------------------------------------------------------------
+
+    fn wifi_settings() -> LabelSettings {
+        let mut settings = LabelSettings::default();
+        settings.qr.kind = QrKind::Wifi;
+        settings.qr.wifi.name = "Guest".to_string();
+        settings.qr.wifi.password = "tea-and-biscuits".to_string();
+        settings
+    }
+
+    #[test]
+    fn a_label_has_a_qr_code_only_when_one_is_asked_for_and_complete() {
+        // None by default.
+        let label = LabelSettings::default().label().unwrap();
+        assert!(!label
+            .elements
+            .iter()
+            .any(|element| matches!(element, Element::Qr(_))));
+
+        // A Wi-Fi network with a name and a password makes a code of the text phones know.
+        let label = wifi_settings().label().unwrap();
+        let codes: Vec<&QrElement> = label
+            .elements
+            .iter()
+            .filter_map(|element| match element {
+                Element::Qr(qr) => Some(qr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].content, "WIFI:T:WPA;S:Guest;P:tea-and-biscuits;;");
+        assert_eq!(codes[0].side, Side::Left);
+        assert_eq!(codes[0].level, QrLevel::Low);
+
+        // The side and the level are used.
+        let mut settings = wifi_settings();
+        settings.qr.side = Side::Right;
+        settings.qr.level = QrLevel::Quartile;
+        let label = settings.label().unwrap();
+        assert!(label.elements.iter().any(|element| matches!(
+            element,
+            Element::Qr(qr) if qr.side == Side::Right && qr.level == QrLevel::Quartile
+        )));
+
+        // A link or some text.
+        let mut settings = LabelSettings::default();
+        settings.qr.kind = QrKind::Text;
+        settings.qr.text = "https://example.com".to_string();
+        let label = settings.label().unwrap();
+        assert!(label.elements.iter().any(
+            |element| matches!(element, Element::Qr(qr) if qr.content == "https://example.com")
+        ));
+    }
+
+    #[test]
+    fn what_is_missing_from_a_qr_code_is_said_instead_of_printing_a_wrong_one() {
+        let mut settings = wifi_settings();
+        settings.qr.wifi.name.clear();
+        assert!(settings.label().unwrap_err().contains("name"));
+
+        let mut settings = wifi_settings();
+        settings.qr.wifi.password.clear();
+        assert!(settings.label().unwrap_err().contains("password"));
+        // A network without a password does not need one.
+        settings.qr.wifi.security = WifiSecurity::None;
+        assert!(settings.label().is_ok());
+
+        let mut settings = LabelSettings::default();
+        settings.qr.kind = QrKind::Text;
+        settings.qr.text = "  ".to_string();
+        assert!(settings.label().unwrap_err().contains("link or some text"));
+        // Nothing is wanted, so nothing is missing.
+        settings.qr.kind = QrKind::Off;
+        assert!(settings.label().is_ok());
+    }
+
+    #[test]
+    fn the_qr_code_is_remembered_but_not_the_password_of_the_wifi_network() {
+        let mut settings = wifi_settings();
+        settings.qr.wifi.security = WifiSecurity::Wep;
+        settings.qr.wifi.hidden = true;
+        settings.qr.side = Side::Right;
+        settings.qr.level = QrLevel::High;
+
+        let saved = Saved::new(&settings, None);
+        let file = toml::to_string_pretty(&saved).expect("it can be written");
+        assert!(!file.contains("tea-and-biscuits"), "{file}");
+        assert!(file.contains("Guest"), "{file}");
+
+        let back = toml::from_str::<Saved>(&file).unwrap().settings();
+        assert_eq!(back.qr.kind, QrKind::Wifi);
+        assert_eq!(back.qr.wifi.name, "Guest");
+        assert_eq!(back.qr.wifi.password, "");
+        assert_eq!(back.qr.wifi.security, WifiSecurity::Wep);
+        assert!(back.qr.wifi.hidden);
+        assert_eq!(back.qr.side, Side::Right);
+        assert_eq!(back.qr.level, QrLevel::High);
+    }
+
+    #[test]
+    fn a_file_from_before_there_were_qr_codes_still_reads_and_has_none() {
+        let saved: Saved = toml::from_str("text = \"Hi\"\n").unwrap();
+        assert_eq!(saved.settings().qr, QrSettings::default());
+        // Nonsense in the file leaves the defaults.
+        let saved: Saved =
+            toml::from_str("[qr]\nkind = \"banana\"\nlevel = \"extreme\"\nside = \"up\"\n").unwrap();
+        assert_eq!(saved.settings().qr, QrSettings::default());
+    }
+
+    #[test]
+    fn the_file_can_be_written_with_both_a_picture_and_a_qr_code_in_it() {
+        // Both are tables, and a table cannot be followed by plain values.
+        let settings = LabelSettings {
+            picture: Some(PictureSettings::new(
+                PathBuf::from("logo.png"),
+                Picture::new(&image::DynamicImage::new_luma8(4, 4)).unwrap(),
+            )),
+            qr: QrSettings {
+                kind: QrKind::Text,
+                text: "hi".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let saved = Saved::new(&settings, Some("AA:BB:CC:DD:EE:FF".to_string()));
+        let file = toml::to_string_pretty(&saved).expect("it can be written");
+        assert!(toml::from_str::<Saved>(&file).is_ok());
     }
 }

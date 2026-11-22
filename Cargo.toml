@@ -22,6 +22,9 @@ derive_more = "0.99.17"
 dimensions = "0.1.0"
 image = { version = "0.24.6", features = ["jpeg", "dds"] }
 imageproc = "0.23.0"
+# QR codes for labels (only the squares: the drawing is done by d30), and a reader that the tests use.
+qrcode = { version = "0.14", default-features = false }
+rqrr = "0.6"
 rusttype = { version = "0.9.3", features = ["gpu_cache"] }
 serialport = "4.2.1"
 tokio = { version = "1.29.1", features = ["full"] }

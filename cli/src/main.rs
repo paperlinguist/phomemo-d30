@@ -16,7 +16,10 @@ use d30::bt;
 use d30::fonts::{FontSource, FontSpec, Fonts};
 use d30::picture::{Picture, Tone};
 use d30::printer::{self, Job};
-use d30::render::{self, Align, Element, Label, Lines, PictureElement, Side, TextElement};
+use d30::qr::{QrLevel, WifiNetwork, WifiSecurity};
+use d30::render::{
+    self, Align, Element, Label, Lines, PictureElement, QrElement, Side, TextElement,
+};
 use d30::stock::{LabelStock, Media, DOTS_PER_MM, STOCKS};
 use d30::D30Scale;
 use image::{imageops, DynamicImage, ImageError, ImageFormat};
@@ -118,6 +121,31 @@ struct ArgsPrintText {
     /// How high the picture is, in mm. As high as the label allows (less the margins) by default
     #[arg(long)]
     picture_height: Option<f32>,
+    /// A QR code to put on the label beside the text: what is in it, such as a link. A phone that
+    /// reads it opens that. The code is as large as the label allows, and is never made smaller
+    #[arg(long, conflicts_with = "wifi")]
+    qr: Option<String>,
+    /// Which end of the label the QR code is at: left or right
+    #[arg(long, default_value = "left")]
+    qr_side: Side,
+    /// How much of the QR code can be lost and still be read: low, medium, quartile or high. The
+    /// lower it is, the fewer squares and so the larger they are, which is what a small label wants
+    #[arg(long, default_value = "low")]
+    qr_level: QrLevel,
+    /// Put a Wi-Fi network in a QR code beside the text: its name. A phone that reads the code
+    /// offers to join the network. See also --wifi-password, --wifi-security and --wifi-hidden
+    #[arg(long, conflicts_with = "qr")]
+    wifi: Option<String>,
+    /// The password of the --wifi network. (It is in the history of the shell and in the list of
+    /// programs while this runs: the window does not keep it)
+    #[arg(long, requires = "wifi")]
+    wifi_password: Option<String>,
+    /// How the --wifi network is secured: wpa (also for WPA2 and WPA3), wep or none
+    #[arg(long, default_value = "wpa", requires = "wifi")]
+    wifi_security: WifiSecurity,
+    /// The --wifi network does not announce its name
+    #[arg(long, requires = "wifi")]
+    wifi_hidden: bool,
     /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by
     /// default, except for labels whose gap is known (14x30), which are printed as continuous
     /// tape with the rows counted by this program, because the printer cannot print the whole
@@ -450,6 +478,35 @@ enum CLIError {
     ParentDirectoryMissing { task: String },
 }
 
+/// What goes into the QR code of the label, if it has one: what `--qr` says, or the text that makes a
+/// phone join the network of `--wifi`.
+fn qr_content(args: &ArgsPrintText) -> Result<Option<String>, CLIError> {
+    match (&args.qr, &args.wifi) {
+        (Some(text), _) => Ok(Some(text.clone())),
+        (None, Some(name)) => {
+            let password = args.wifi_password.clone().unwrap_or_default();
+            if args.wifi_security != WifiSecurity::None && password.is_empty() {
+                return Err(CLIError::BadOption {
+                    reason: format!(
+                        "the network {name} is secured, so it needs its password: give it with \
+                         --wifi-password, or say --wifi-security none for a network without one"
+                    ),
+                });
+            }
+            Ok(Some(
+                WifiNetwork {
+                    name: name.clone(),
+                    password,
+                    security: args.wifi_security,
+                    hidden: args.wifi_hidden,
+                }
+                .payload(),
+            ))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 /// Connects to the printer, trying again when it does not answer. Gives up for good (and ends the
 /// program) after `max_retries` more tries. With `dry_run` nothing is connected and `None` comes back.
 fn connect_with_retries(
@@ -644,6 +701,12 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
         picture.height = args.picture_height.map(|mm| mm * DOTS_PER_MM);
         picture.margin = args.margins;
         label.elements.push(Element::Picture(picture));
+    }
+    if let Some(content) = qr_content(&args)? {
+        let mut qr = QrElement::new(content);
+        qr.side = args.qr_side;
+        qr.level = args.qr_level;
+        label.elements.push(Element::Qr(qr));
     }
 
     let rendered = render::render(&label, &fonts).context(D30LibSnafu)?;

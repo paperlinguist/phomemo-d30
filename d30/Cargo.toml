@@ -12,6 +12,7 @@ dimensions.workspace = true
 derive_more.workspace = true
 image.workspace = true
 imageproc.workspace = true
+qrcode.workspace = true
 rusttype.workspace = true
 serialport.workspace = true
 snafu.workspace = true
@@ -24,6 +25,9 @@ indexmap.workspace = true
 advmac.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+rqrr.workspace = true
 
 [features]
 default = ["bluetooth"]

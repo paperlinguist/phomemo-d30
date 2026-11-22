@@ -4,9 +4,9 @@
 //! label, which gives both the preview (what the label will look like) and the [`Raster`] to send to
 //! the printer. They come from the same dots, so the preview is exactly what is printed.
 
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
-use image::{imageops, GrayImage, Luma};
+use image::{imageops, DynamicImage, GrayImage, Luma};
 use imageproc::drawing::{draw_text_mut, text_size};
 use rusttype::{point, Font, Scale};
 
@@ -14,6 +14,7 @@ use crate::{
     fonts::{has_glyph, FontSpec, Fonts},
     picture::{Picture, Tone},
     protocol::{Raster, MAX_ROWS},
+    qr::{QrLevel, Squares},
     stock::{mm_to_dots, LabelStock, TapePlan, PRINT_WIDTH_DOTS},
     D30Error, D30Scale,
 };
@@ -121,6 +122,9 @@ pub struct PictureElement {
     /// The space left free above and below the picture and between it and the edge of the label, in
     /// dots.
     pub margin: f32,
+    /// The picture is already the dots to burn (a QR code is), and is put on the label as it is: not
+    /// scaled, so `height` and the 60% limit do not apply to it.
+    pub exact: bool,
 }
 
 impl PictureElement {
@@ -133,6 +137,50 @@ impl PictureElement {
             invert: false,
             height: None,
             margin: 15.0,
+            exact: false,
+        }
+    }
+}
+
+/// The space left free between a QR code and the end of the label, or the text beside it, unless it
+/// is told otherwise, in dots (1.5 mm). The squares of a code have to be clear of the rounded corners
+/// of a label.
+pub const QR_MARGIN: f32 = 12.0;
+
+/// The space left free above and below a QR code, in dots (0.5 mm). It is small, because every dot
+/// of height that is spared makes the squares of the code bigger (a typical Wi-Fi code of 29 squares
+/// across gets 3 dots each instead of 2), and a code of big squares is read more easily.
+pub const QR_VERTICAL_MARGIN: u32 = 4;
+
+/// The smallest a square of a QR code is made, in dots. Smaller than that and a phone can hardly
+/// read what the printer burns.
+pub const MIN_QR_SQUARE_DOTS: u32 = 2;
+
+/// A QR code on a label.
+///
+/// It goes beside the text like a picture, at the left or the right end of the label, as large as
+/// the label is high allows, with every square a whole number of dots so that its edges are sharp.
+/// It is never made smaller to make room: if it does not fit, drawing the label fails and says so.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QrElement {
+    /// What is in the code: a link, some text, or the details of a Wi-Fi network (see
+    /// [`crate::qr::WifiNetwork::payload`]).
+    pub content: String,
+    pub level: QrLevel,
+    /// Which end of the label it is at.
+    pub side: Side,
+    /// The space left free between the code and the end of the label or the text beside it, in dots.
+    pub margin: f32,
+}
+
+impl QrElement {
+    /// A QR code of `content` at the left end of the label, with the smallest level of correction.
+    pub fn new(content: impl Into<String>) -> Self {
+        QrElement {
+            content: content.into(),
+            level: QrLevel::default(),
+            side: Side::Left,
+            margin: QR_MARGIN,
         }
     }
 }
@@ -143,6 +191,7 @@ impl PictureElement {
 pub enum Element {
     Text(TextElement),
     Picture(PictureElement),
+    Qr(QrElement),
 }
 
 /// A label: a kind of label stock and what is on it.
@@ -225,6 +274,8 @@ impl Rendered {
 /// times their shape, and the text is made as large as fits what is left. On uncut tape that is cut
 /// to fit its content, the label is as long as all of that together.
 pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
+    let label = with_qr_codes_as_pictures(label)?;
+    let label = label.as_ref();
     let height = PRINT_WIDTH_DOTS;
     let fixed_length = fixed_length(label)?;
     // How far from each end of the label the content has to stay: where the label's front cannot be
@@ -252,6 +303,20 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
             _ => None,
         })
         .collect();
+    // What cannot be made smaller (a QR code) has to fit on a label of a set length by itself.
+    if let Some(length) = fixed_length {
+        let fixed: u64 = pictures
+            .iter()
+            .filter(|picture| picture.element.exact)
+            .map(SizedPicture::extent)
+            .sum();
+        if fixed >= u64::from(length) {
+            return Err(invalid(format!(
+                "the QR code does not fit on this label: it takes {fixed} dots (with its margin) \
+                 of the {length} dots that the label is long"
+            )));
+        }
+    }
 
     // Pictures without any text to speak of stand alone, in the middle.
     let alone = !pictures.is_empty() && texts.iter().all(|text| text.text.trim().is_empty());
@@ -364,6 +429,53 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
     Ok(Rendered { canvas })
 }
 
+/// The label with its QR codes drawn as pictures of their own dots, which then lay out like any
+/// picture. The label itself if it has none.
+fn with_qr_codes_as_pictures(label: &Label) -> Result<Cow<'_, Label>, D30Error> {
+    if !label
+        .elements
+        .iter()
+        .any(|element| matches!(element, Element::Qr(_)))
+    {
+        return Ok(Cow::Borrowed(label));
+    }
+    let mut drawn = label.clone();
+    for element in &mut drawn.elements {
+        if let Element::Qr(qr) = element {
+            let picture = qr_picture(qr)?;
+            *element = Element::Picture(picture);
+        }
+    }
+    Ok(Cow::Owned(drawn))
+}
+
+/// A QR code as a picture whose squares are blocks of dots, as large as the print head is wide
+/// allows (less [`QR_VERTICAL_MARGIN`] above and below).
+fn qr_picture(qr: &QrElement) -> Result<PictureElement, D30Error> {
+    let squares = Squares::new(&qr.content, qr.level)?;
+    let across = squares.width() as u32;
+    let margin = qr.margin.max(0.0);
+    let room = PRINT_WIDTH_DOTS.saturating_sub(2 * QR_VERTICAL_MARGIN);
+    let size = room / across;
+    if size < MIN_QR_SQUARE_DOTS {
+        return Err(invalid(format!(
+            "that is too much for a QR code on this label: it has {across} x {across} squares, and \
+             with the {room} dots that the label is high (less the margin) they would be less than \
+             {MIN_QR_SQUARE_DOTS} dots across, which a phone can hardly read. Use less text, or a \
+             lower level of error correction"
+        )));
+    }
+    let image = squares.image(size);
+    let side = image.height() as f32;
+    let picture = Picture::new(&DynamicImage::ImageLuma8(image))?;
+    let mut element = PictureElement::new(picture);
+    element.side = qr.side;
+    element.height = Some(side);
+    element.margin = margin;
+    element.exact = true;
+    Ok(element)
+}
+
 /// A picture with the size it gets on the label worked out.
 struct SizedPicture<'a> {
     element: &'a PictureElement,
@@ -387,6 +499,15 @@ impl<'a> SizedPicture<'a> {
         // (`max` and `clamp` leave a NaN out, which is how a size that is not a number ends up as
         // the smallest there is.)
         let margin = element.margin.max(0.0);
+        // A picture that is only the dots to burn, a QR code, is put on as it is.
+        if element.exact {
+            return SizedPicture {
+                element,
+                width: element.picture.width(),
+                height: element.picture.height(),
+                margin: margin.max(keep_clear).round() as u32,
+            };
+        }
         let band = band as f32;
         let wanted = match element.height {
             Some(height) => height.clamp(1.0, band),
@@ -426,7 +547,8 @@ impl<'a> SizedPicture<'a> {
 const PICTURES_SHARE: f32 = 0.6;
 
 /// Makes pictures smaller, all by the same factor, if together with their margins they take more
-/// than their share of a label that is `length` dots long.
+/// than their share of a label that is `length` dots long. The ones that are only dots to burn (QR
+/// codes) keep their size, and the others make room for them.
 fn limit_pictures(pictures: &mut [SizedPicture], length: u32) {
     let budget = (length as f32 * PICTURES_SHARE).floor();
     let margins: f32 = pictures.iter().map(|picture| picture.margin as f32).sum();
@@ -434,8 +556,17 @@ fn limit_pictures(pictures: &mut [SizedPicture], length: u32) {
     if margins + widths <= budget {
         return;
     }
-    let factor = ((budget - margins).max(1.0) / widths).min(1.0);
-    for picture in pictures {
+    let kept: f32 = pictures
+        .iter()
+        .filter(|picture| picture.element.exact)
+        .map(|picture| picture.width as f32)
+        .sum();
+    let shrinking = widths - kept;
+    if shrinking <= 0.0 {
+        return;
+    }
+    let factor = ((budget - margins - kept).max(1.0) / shrinking).min(1.0);
+    for picture in pictures.iter_mut().filter(|picture| !picture.element.exact) {
         picture.width = ((picture.width as f32 * factor).floor() as u32).max(1);
         picture.height = ((picture.height as f32 * factor).round() as u32).max(1);
     }
@@ -1935,5 +2066,150 @@ mod tests {
         let rendered = render_text("12x40", "Hello");
         let plan = stock("12x40").tape_plan(None, None, None);
         assert_eq!(rendered.raster_for(&plan).unwrap(), rendered.raster().unwrap());
+    }
+
+    // ---- QR codes ------------------------------------------------------------------------------
+
+    /// What a QR reader makes of the dots of a label: the text of the first code it finds.
+    fn read_qr(rendered: &Rendered) -> Option<String> {
+        let preview = rendered.preview();
+        // A reader wants some white around a code, as a code on paper has.
+        let border = 24;
+        let mut padded = GrayImage::from_pixel(
+            preview.width() + 2 * border,
+            preview.height() + 2 * border,
+            Luma([255]),
+        );
+        imageops::overlay(&mut padded, &preview, i64::from(border), i64::from(border));
+        let mut prepared = rqrr::PreparedImage::prepare(padded);
+        let grids = prepared.detect_grids();
+        let (_, content) = grids.first()?.decode().ok()?;
+        Some(content)
+    }
+
+    fn qr_label(id: &str, text: &str, qr: QrElement) -> Label {
+        let mut label = Label::text(stock(id), text);
+        label.elements.push(Element::Qr(qr));
+        label
+    }
+
+    const WIFI: &str = "WIFI:T:WPA;S:Guest;P:tea-and-biscuits;;";
+
+    #[test]
+    fn a_qr_code_beside_text_can_be_read_back_from_the_dots_of_the_label() {
+        for (id, content, side) in [
+            ("12x40", "https://example.com/menu", Side::Left),
+            ("12x40", WIFI, Side::Right),
+            ("14x30", WIFI, Side::Left),
+            ("15x50", "hello", Side::Left),
+            ("14x40", "WIFI:T:WPA;S:Joe's\\; \\\"net\\\";P:a\\\\b\\:c;H:true;;", Side::Right),
+        ] {
+            let mut qr = QrElement::new(content);
+            qr.side = side;
+            let rendered = draw_label(&qr_label(id, "Guest Wi-Fi", qr));
+            assert_eq!(
+                read_qr(&rendered).as_deref(),
+                Some(content),
+                "{id} {side:?} {content}"
+            );
+            // The text is there too, beside the code.
+            assert!(ink(&rendered) > 0);
+        }
+    }
+
+    #[test]
+    fn a_qr_code_alone_is_in_the_middle_and_its_squares_are_blocks_of_whole_dots() {
+        let mut label = Label::new(stock("12x40"));
+        label
+            .elements
+            .push(Element::Qr(QrElement::new("HELLO")));
+        let rendered = draw_label(&label);
+        // 21 squares of 4 dots: 84 dots, as high as 96 dots less 6 above and below allows.
+        let squares = crate::qr::Squares::new("HELLO", QrLevel::Low).unwrap();
+        assert_eq!(squares.width(), 21);
+        let code = squares.image(4);
+        assert_eq!((code.width(), code.height()), (84, 84));
+        let (left, top) = ((320 - 84) / 2, (96 - 84) / 2);
+        for y in 0..96u32 {
+            for x in 0..320u32 {
+                let inside = (left..left + 84).contains(&x) && (top..top + 84).contains(&y);
+                let ink = rendered.canvas().get_pixel(x, y).0[0] > 127;
+                let expected = inside && code.get_pixel(x - left, y - top).0[0] == 0;
+                assert_eq!(ink, expected, "dot {x},{y}");
+            }
+        }
+        assert_eq!(read_qr(&rendered).as_deref(), Some("HELLO"));
+    }
+
+    #[test]
+    fn a_qr_code_that_is_too_big_or_does_not_fit_is_an_error_that_says_so() {
+        // Too many squares for the height of the print head.
+        let mut qr = QrElement::new("x".repeat(200));
+        qr.level = QrLevel::High;
+        let error = render(&qr_label("12x40", "", qr), &Fonts::embedded())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("QR code"), "{error}");
+        // A label that is too short for the code.
+        let error = render(
+            &qr_label("12x8", "", QrElement::new("HELLO")),
+            &Fonts::embedded(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("does not fit"), "{error}");
+        // Nothing in the code.
+        let error = render(
+            &qr_label("12x40", "", QrElement::new("")),
+            &Fonts::embedded(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("nothing"), "{error}");
+    }
+
+    #[test]
+    fn a_qr_code_keeps_clear_of_the_front_of_a_label_that_cannot_be_printed() {
+        let alone = {
+            let mut label = Label::new(stock("14x30"));
+            label.elements.push(Element::Qr(QrElement::new(WIFI)));
+            draw_label(&label)
+        };
+        let (first, last) = ink_columns(&alone).unwrap();
+        assert!(first >= KEEP_CLEAR && last < 242 - KEEP_CLEAR, "{first} {last}");
+
+        for side in [Side::Left, Side::Right] {
+            let mut qr = QrElement::new(WIFI);
+            qr.side = side;
+            let beside_text = draw_label(&qr_label("14x30", "Wi-Fi", qr));
+            let (first, last) = ink_columns(&beside_text).unwrap();
+            assert!(first >= KEEP_CLEAR && last < 242 - KEEP_CLEAR, "{side:?} {first} {last}");
+            assert_eq!(read_qr(&beside_text).as_deref(), Some(WIFI), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn a_qr_code_keeps_its_size_when_a_wide_picture_has_to_make_room() {
+        let mut label = qr_label("12x40", "Hi", QrElement::new("HELLO"));
+        label.elements.push(Element::Picture(picture_element(
+            black(900, 40),
+            Side::Right,
+            15.0,
+        )));
+        let rendered = draw_label(&label);
+        assert_eq!(read_qr(&rendered).as_deref(), Some("HELLO"));
+    }
+
+    #[test]
+    fn the_squares_of_a_code_do_not_get_blurred_whatever_the_label() {
+        // Whatever it is beside, each square is all dots or none: the dots of the code make a
+        // picture with only black and white in it, with blocks as wide as the squares.
+        for id in ["12x40", "14x30", "15-continuous"] {
+            let rendered = draw_label(&qr_label(id, "Wi-Fi", QrElement::new(WIFI)));
+            assert_eq!(read_qr(&rendered).as_deref(), Some(WIFI), "{id}");
+        }
     }
 }

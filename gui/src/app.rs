@@ -16,6 +16,7 @@ use d30::{
     fonts::Fonts,
     picture::Picture,
     printer::{self, Command, Event, Job, Printer},
+    qr::{QrLevel, WifiSecurity},
     render::{self, Align, Lines, Side},
     stock::{LabelStock, STOCKS},
 };
@@ -24,7 +25,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     emoji::{self, Emoji},
     preview::Preview,
-    settings::{LabelSettings, PictureSettings, Saved},
+    settings::{LabelSettings, PictureSettings, QrKind, Saved},
 };
 
 /// How big the window starts out, and the smallest it can be made, in points.
@@ -46,6 +47,11 @@ pub struct Options {
     pub picture_side: Option<Side>,
     pub picture_dither: bool,
     pub picture_invert: bool,
+    /// A QR code of a link or text, or of a Wi-Fi network (name and password), and at which end.
+    pub qr: Option<String>,
+    pub qr_side: Option<Side>,
+    pub wifi: Option<String>,
+    pub wifi_password: Option<String>,
     /// Open the emoji picker.
     pub emoji: bool,
 }
@@ -194,6 +200,8 @@ pub struct App {
 
     /// Why the picture could not be read, if that is so.
     picture_error: Option<String>,
+    /// The password of the Wi-Fi network shows as text instead of dots.
+    show_wifi_password: bool,
     /// The person has asked to choose a picture file. The dialog is opened by [`eframe::App::ui`],
     /// which has the window to put it in front of.
     pick_picture: bool,
@@ -242,6 +250,17 @@ impl App {
         if let Some(font) = options.font {
             settings.font = Some(font);
         }
+        if let Some(name) = options.wifi {
+            settings.qr.kind = QrKind::Wifi;
+            settings.qr.wifi.name = name;
+            settings.qr.wifi.password = options.wifi_password.unwrap_or_default();
+        } else if let Some(text) = options.qr {
+            settings.qr.kind = QrKind::Text;
+            settings.qr.text = text;
+        }
+        if let Some(side) = options.qr_side {
+            settings.qr.side = side;
+        }
 
         let saved_address = saved
             .printer
@@ -274,6 +293,7 @@ impl App {
             preview: None,
             previewed: None,
             picture_error: None,
+            show_wifi_password: false,
             pick_picture: false,
             emoji: EmojiPicker {
                 open_now: options.emoji,
@@ -720,6 +740,7 @@ impl App {
         ui.add(egui::Slider::new(&mut self.settings.margin, 0.0..=60.0).text("margin (dots)"));
 
         self.picture_section(ui);
+        self.qr_section(ui);
 
         ui.add_space(10.0);
         ui.heading("Label");
@@ -1031,6 +1052,88 @@ impl App {
         }
     }
 
+    fn qr_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.heading("QR code");
+        let qr = &mut self.settings.qr;
+        egui::ComboBox::from_id_salt("qr kind")
+            .width(200.0)
+            .selected_text(qr.kind.name())
+            .show_ui(ui, |ui| {
+                for kind in QrKind::ALL {
+                    ui.selectable_value(&mut qr.kind, kind, kind.name());
+                }
+            });
+        match qr.kind {
+            QrKind::Off => return,
+            QrKind::Wifi => {
+                ui.horizontal(|ui| {
+                    ui.label("Network name:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut qr.wifi.name)
+                            .hint_text("the name of the Wi-Fi")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                egui::ComboBox::from_id_salt("wifi security")
+                    .width(200.0)
+                    .selected_text(qr.wifi.security.name())
+                    .show_ui(ui, |ui| {
+                        for security in WifiSecurity::ALL {
+                            ui.selectable_value(&mut qr.wifi.security, security, security.name());
+                        }
+                    });
+                if qr.wifi.security != WifiSecurity::None {
+                    ui.horizontal(|ui| {
+                        ui.label("Password:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut qr.wifi.password)
+                                .password(!self.show_wifi_password)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    ui.checkbox(&mut self.show_wifi_password, "Show the password")
+                        .on_hover_text("The password is not saved when you close the window");
+                }
+                ui.checkbox(&mut qr.wifi.hidden, "A hidden network")
+                    .on_hover_text("The network does not announce its name");
+            }
+            QrKind::Text => {
+                ui.add(
+                    egui::TextEdit::multiline(&mut qr.text)
+                        .hint_text("A link (https://…) or some text")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("Side:");
+            ui.selectable_value(&mut qr.side, Side::Left, "Left");
+            ui.selectable_value(&mut qr.side, Side::Right, "Right");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Error correction:");
+            egui::ComboBox::from_id_salt("qr level")
+                .width(110.0)
+                .selected_text(level_name(qr.level))
+                .show_ui(ui, |ui| {
+                    for level in QrLevel::ALL {
+                        ui.selectable_value(&mut qr.level, level, level_name(level))
+                            .on_hover_text(level_hint(level));
+                    }
+                });
+        });
+        ui.label(
+            RichText::new(
+                "The code is as large as the label allows, and a longer text makes it smaller. \
+                 Low makes the largest code.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
     /// The whole window, once.
     fn show(&mut self, ui: &mut egui::Ui) {
         // A picture file dropped on the window goes on the label.
@@ -1063,6 +1166,25 @@ impl App {
 
         show_what_is_being_dropped(ui.ctx());
         self.handle_screenshot(ui);
+    }
+}
+
+/// What the levels of error correction of a QR code are called in the window.
+fn level_name(level: QrLevel) -> &'static str {
+    match level {
+        QrLevel::Low => "Low",
+        QrLevel::Medium => "Medium",
+        QrLevel::Quartile => "Quartile",
+        QrLevel::High => "High",
+    }
+}
+
+fn level_hint(level: QrLevel) -> &'static str {
+    match level {
+        QrLevel::Low => "The smallest code, so the largest squares: what a small label wants",
+        QrLevel::Medium => "A code that can be a little damaged and still be read",
+        QrLevel::Quartile => "A sturdier code, with more and smaller squares",
+        QrLevel::High => "The sturdiest code, with the most and the smallest squares",
     }
 }
 
@@ -1824,5 +1946,127 @@ mod tests {
             ink > 300,
             "an apple is a big shape, but there are {ink} dots"
         );
+    }
+
+    // ---- the QR code ---------------------------------------------------------------------------
+
+    /// A screen that is tall enough for the whole of the settings, so that nothing in them is
+    /// scrolled out of sight, and as narrow as the window can be.
+    const TALL_AND_NARROW: [f32; 2] = [MIN_WINDOW_SIZE[0], 2400.0];
+
+    #[test]
+    fn the_qr_section_shows_only_the_choice_until_a_code_is_wanted() {
+        let mut app = test_app();
+        let shown = lay_out(&mut app, TALL_AND_NARROW);
+        assert!(shown.iter().any(|text| text.text == "QR code"));
+        assert!(shown.iter().any(|text| text.text == "No QR code"));
+        assert!(!shown.iter().any(|text| text.text.contains("Network name")));
+        assert!(!shown.iter().any(|text| text.text.contains("Error correction")));
+    }
+
+    #[test]
+    fn a_wifi_code_has_fields_for_the_network_and_all_of_them_fit_the_narrowest_window() {
+        let mut app = test_app();
+        app.settings.qr.kind = QrKind::Wifi;
+        let shown = lay_out(&mut app, TALL_AND_NARROW);
+        for wanted in [
+            "Wi-Fi network",
+            "Network name:",
+            "Password:",
+            "Show the password",
+            "A hidden network",
+            "Side:",
+            "Error correction:",
+        ] {
+            assert!(
+                shown.iter().any(|text| text.text == wanted),
+                "{wanted} is not there: {:?}",
+                shown.iter().map(|text| text.text.as_str()).collect::<Vec<_>>()
+            );
+        }
+        let beyond: Vec<&str> = shown
+            .iter()
+            .filter(|text| text.right > TALL_AND_NARROW[0] + 0.5)
+            .map(|text| text.text.as_str())
+            .collect();
+        assert!(beyond.is_empty(), "runs off the right edge: {beyond:?}");
+
+        // An open network has no password to type.
+        app.settings.qr.wifi.security = WifiSecurity::None;
+        let shown = lay_out(&mut app, TALL_AND_NARROW);
+        assert!(!shown.iter().any(|text| text.text == "Password:"));
+        assert!(shown.iter().any(|text| text.text == "A hidden network"));
+    }
+
+    #[test]
+    fn a_code_of_a_link_has_a_box_for_it_and_no_wifi_fields() {
+        let mut app = test_app();
+        app.settings.qr.kind = QrKind::Text;
+        let shown = lay_out(&mut app, TALL_AND_NARROW);
+        assert!(shown.iter().any(|text| text.text == "Link or text"));
+        assert!(shown.iter().any(|text| text.text == "Error correction:"));
+        assert!(!shown.iter().any(|text| text.text.contains("Network name")));
+    }
+
+    #[test]
+    fn what_is_missing_from_the_code_is_said_where_the_preview_would_be_and_nothing_is_printed() {
+        let mut app = test_app();
+        app.settings.qr.kind = QrKind::Wifi;
+        app.settings.qr.wifi.name = "Guest".to_string();
+        // No password yet.
+        let shown = lay_out(&mut app, WINDOW_SIZE);
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.text.contains("Type the password of the Wi-Fi network")),
+            "{:?}",
+            shown.iter().map(|text| text.text.as_str()).collect::<Vec<_>>()
+        );
+        assert!(matches!(app.preview, Some(Err(_))), "nothing can be printed yet");
+
+        // With the password the label is drawn, and the message is gone.
+        app.settings.qr.wifi.password = "tea-and-biscuits".to_string();
+        let shown = lay_out(&mut app, WINDOW_SIZE);
+        assert!(!shown
+            .iter()
+            .any(|text| text.text.contains("Type the password")));
+        assert!(matches!(app.preview, Some(Ok(_))));
+    }
+
+    #[test]
+    fn the_command_line_can_start_the_window_with_a_wifi_code_or_a_link() {
+        let discovery = devices::Discovery {
+            devices: vec![device("D30", 1)],
+            ..Default::default()
+        };
+        let app = App::assemble(
+            Saved::default(),
+            discovery,
+            Fonts::embedded(),
+            Printer::start(Unreachable, 1, || {}),
+            Options {
+                wifi: Some("Guest".to_string()),
+                wifi_password: Some("tea-and-biscuits".to_string()),
+                qr_side: Some(Side::Right),
+                ..Options::default()
+            },
+        );
+        assert_eq!(app.settings.qr.kind, QrKind::Wifi);
+        assert_eq!(app.settings.qr.wifi.name, "Guest");
+        assert_eq!(app.settings.qr.wifi.password, "tea-and-biscuits");
+        assert_eq!(app.settings.qr.side, Side::Right);
+
+        let app = App::assemble(
+            Saved::default(),
+            devices::Discovery::default(),
+            Fonts::embedded(),
+            Printer::start(Unreachable, 1, || {}),
+            Options {
+                qr: Some("https://example.com".to_string()),
+                ..Options::default()
+            },
+        );
+        assert_eq!(app.settings.qr.kind, QrKind::Text);
+        assert_eq!(app.settings.qr.text, "https://example.com");
     }
 }
