@@ -11,7 +11,6 @@ use std::{
 };
 
 use advmac::{MacAddr6, MacAddrFormat, ParseError};
-use bluetooth_serial_port_async::{BtAddr, BtError, BtSocket};
 use clap::{Parser, Subcommand};
 use d30::D30Scale;
 use image::{DynamicImage, ImageError, ImageFormat};
@@ -19,6 +18,9 @@ use inquire::InquireError;
 use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
+
+// How we talk to the printer over Bluetooth differs per platform.
+mod bt;
 
 #[derive(Debug, Parser)]
 #[command(name = "d30")]
@@ -68,14 +70,27 @@ struct ArgsPrintText {
 // ---------------------
 // End CLI Processing
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum PreviewType {
     Wezterm,
     CustomCommand(Vec<String>),
     ShowImage,
-    #[default]
+    /// GNOME's `gio open`.
     Gio,
+    /// Whatever the OS opens images with: `explorer` on Windows, `xdg-open` elsewhere.
+    System,
+}
+
+impl Default for PreviewType {
+    fn default() -> Self {
+        // `gio` comes with GNOME-ish Linux desktops, while every Windows has a default image viewer.
+        if cfg!(windows) {
+            PreviewType::System
+        } else {
+            PreviewType::Gio
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -92,11 +107,7 @@ struct Config {
 
 impl Config {
     fn load_config() -> Result<Self, CLIError> {
-        let phomemo_lib_path = xdg::BaseDirectories::with_prefix("phomemo-library")
-            .context(CouldNotGetXDGPathSnafu)?;
-        let config_path = phomemo_lib_path
-            .place_config_file("phomemo-cli-config.toml")
-            .context(CouldNotPlaceConfigFileSnafu)?;
+        let config_path = d30::place_config_file("phomemo-cli-config.toml").context(D30LibSnafu)?;
         let contents = fs::read_to_string(config_path).context(CouldNotReadFileSnafu)?;
         Ok(toml::from_str(contents.as_str()).context(CouldNotParseTOMLSnafu)?)
     }
@@ -141,6 +152,8 @@ enum Accepted {
 fn backend_show_image(preview_image: DynamicImage) -> Result<Accepted, CLIError> {
     // let mut accepted = Accepted::Unknown;
 
+    // `d30-cli-preview.exe` on Windows.
+    let preview_exe = format!("d30-cli-preview{}", std::env::consts::EXE_SUFFIX);
     let possible_child_targets: Vec<PathBuf> = vec![
         std::env::current_exe()
             .context(IOSnafu {
@@ -150,8 +163,8 @@ fn backend_show_image(preview_image: DynamicImage) -> Result<Accepted, CLIError>
             .context(ParentDirectoryMissingSnafu {
                 task: "find parent of current exe",
             })?
-            .join("d30-cli-preview"),
-        "d30-cli-preview".into(),
+            .join(&preview_exe),
+        preview_exe.into(),
     ];
     for target in possible_child_targets {
         match Command::new(target).stdin(Stdio::piped()).spawn() {
@@ -195,7 +208,7 @@ fn cmd_show_preview(
     preview: Option<PreviewType>,
     preview_image: DynamicImage,
 ) -> Result<Accepted, CLIError> {
-    let preview = preview.unwrap_or(PreviewType::Gio);
+    let preview = preview.unwrap_or_default();
     let preview_image_file = temp_file::TempFile::new().context(IOSnafu {
         task: "init path to temporary file",
     })?;
@@ -242,6 +255,16 @@ fn cmd_show_preview(
 
         PreviewType::Gio => {
             run(vec!["gio".to_string(), "open".to_string(), path])?;
+            Accepted::Unknown
+        }
+
+        PreviewType::System => {
+            let opener = if cfg!(windows) {
+                "explorer.exe"
+            } else {
+                "xdg-open"
+            };
+            run(vec![opener.to_string(), path])?;
             Accepted::Unknown
         }
     })
@@ -297,7 +320,7 @@ enum CLIError {
     FailedToPromptUser { source: InquireError },
 
     #[snafu(display("Error while attempting task `{task}` in bluetooth backend: {source}"))]
-    BluetoothBackend { source: BtError, task: String },
+    BluetoothBackend { source: bt::Error, task: String },
 
     #[snafu(display("IO error while attempting to execute task: {task}"))]
     IOError {
@@ -308,10 +331,6 @@ enum CLIError {
     #[snafu(display("IO error while attempting to execute task: {task}"))]
     ImageError { task: String, source: ImageError },
 
-    #[snafu(display("Could not get XDG path"))]
-    CouldNotGetXDGPath { source: xdg::BaseDirectoriesError },
-    #[snafu(display("Could not place config file"))]
-    CouldNotPlaceConfigFile { source: io::Error },
     #[snafu(display("Failed to read in automatically detected D30 CLI configuration path"))]
     CouldNotReadFile { source: io::Error },
     #[snafu(display("Failed to serialize TOML D30 config"))]
@@ -373,7 +392,7 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
         }
     }
 
-    let mut socket: Option<BtSocket> = None;
+    let mut socket: Option<bt::RfcommStream> = None;
     println!("Connecting...");
     'retry: for retries in 0.. {
         info!("Retry #{}", retries);
@@ -382,11 +401,9 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
                 "Failed to connect after {} retries!\n\
                  The printer never answered. Usual causes:\n\
                  - it is switched off, asleep, or out of range\n\
-                 - it is not bonded, in which case it ignores us entirely\n\
-                 Run `bluetoothctl info {}` and look for UUID 00001101 (Serial Port).\n\
-                 If that entry is missing, pair the device again.",
+                 {}",
                 args.max_retries,
-                addr.format_string(MacAddrFormat::ColonNotation),
+                bt::connection_help(&addr.format_string(MacAddrFormat::ColonNotation)),
             );
             exit(1);
         }
@@ -394,40 +411,28 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             break 'retry;
         }
 
-        let mut new_socket = match BtSocket::new(bluetooth_serial_port_async::BtProtocol::RFCOMM)
-            .context(BluetoothBackendSnafu {
-                task: "opening socket".to_string(),
-            }) {
-            Ok(v) => v,
+        match bt::connect(addr).context(BluetoothBackendSnafu {
+            task: "connecting to the printer".to_string(),
+        }) {
+            Ok(new_socket) => {
+                socket = Some(new_socket);
+                break 'retry;
+            }
             Err(e) => {
                 error!(
-                    "Error while trying to open socket, on attempt #{}:\n{}",
+                    "Error while trying to connect, on attempt #{}:\n{}",
                     retries, e
                 );
                 continue 'retry;
             }
-        };
-
-        if let Err(e) = new_socket.connect(BtAddr(addr.to_array())) {
-            error!(
-                "Error while trying to connect, on attempt #{}:\n{}",
-                retries, e
-            );
-            continue 'retry;
         }
-
-        socket = Some(new_socket);
-        break 'retry;
     }
 
     debug!("Init connection");
     if let Some(socket) = &mut socket {
-        socket
-            .write(d30::INIT_BASE_FLAT)
-            .map(|x| x)
-            .context(IOSnafu {
-                task: "send magic init bytes".to_string(),
-            })?;
+        socket.write_all(d30::INIT_BASE_FLAT).context(IOSnafu {
+            task: "send magic init bytes".to_string(),
+        })?;
     }
     debug!("Extend output");
 
@@ -442,7 +447,7 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             output.extend(d30::pack_image(&chunk));
             debug!("Write output to socket");
             if let Some(socket) = &mut socket {
-                socket.write(output.as_slice()).context(IOSnafu {
+                socket.write_all(output.as_slice()).context(IOSnafu {
                     task: format!("write image #{}", image_num),
                 })?;
             }
@@ -473,7 +478,9 @@ async fn main() -> Result<(), CLIError> {
             debug!("Could not read file: {}", source);
             Config::default()
         }
-        Err(CLIError::CouldNotPlaceConfigFile { source }) => {
+        Err(CLIError::D30LibError {
+            source: d30::D30Error::CouldNotPlaceConfigFile { source },
+        }) => {
             debug!("Could not place config file: {}", source);
             Config::default()
         }
@@ -491,4 +498,47 @@ async fn main() -> Result<(), CLIError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview_from_config(toml: &str) -> Option<PreviewType> {
+        toml::from_str::<Config>(toml).unwrap().preview
+    }
+
+    #[test]
+    fn preview_names_in_config_files() {
+        assert_eq!(
+            preview_from_config(r#"preview = "gio""#),
+            Some(PreviewType::Gio)
+        );
+        assert_eq!(
+            preview_from_config(r#"preview = "system""#),
+            Some(PreviewType::System)
+        );
+        assert_eq!(
+            preview_from_config(r#"preview = "show_image""#),
+            Some(PreviewType::ShowImage)
+        );
+        assert_eq!(
+            preview_from_config(r#"preview = "wezterm""#),
+            Some(PreviewType::Wezterm)
+        );
+        assert_eq!(
+            preview_from_config(r#"preview = { custom_command = ["mspaint"] }"#),
+            Some(PreviewType::CustomCommand(vec!["mspaint".to_string()]))
+        );
+    }
+
+    #[test]
+    fn default_preview_is_something_the_platform_has() {
+        let expected = if cfg!(windows) {
+            PreviewType::System
+        } else {
+            PreviewType::Gio
+        };
+        assert_eq!(PreviewType::default(), expected);
+    }
 }

@@ -10,7 +10,6 @@ keywords.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bluetooth-serial-port-async.workspace = true
 derive_more.workspace = true
 dimensions.workspace = true
 image.workspace = true
@@ -28,9 +27,15 @@ toml.workspace = true
 advmac.workspace = true
 inquire.workspace = true
 serde.workspace = true
-xdg.workspace = true
 temp-file.workspace = true
 merge.workspace = true
 serde_merge.workspace = true
 png.workspace = true
 unescape.workspace = true
+
+# The Bluetooth transport is platform specific; see cli/src/bt/.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluetooth-serial-port-async.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
