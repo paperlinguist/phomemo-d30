@@ -34,21 +34,40 @@ jobs:
           persist-credentials: false
 
       # Rust (with the MSVC toolchain) comes preinstalled on the runner image.
+
+      # The GUI is a workspace of its own (see gui/Cargo.toml) and its libraries take several
+      # minutes to build, so what has been built is kept for the next run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gui -> target
+
       - name: Test
         run: cargo test --locked --target x86_64-pc-windows-msvc -p d30 -p d30-cli
 
       - name: Build
         run: cargo build --release --locked --target x86_64-pc-windows-msvc -p d30-cli
 
-      - name: Smoke test the executable
+      # In release mode, so that the tests and the build that follows share one compile.
+      - name: Test the GUI
+        working-directory: gui
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build the GUI
+        working-directory: gui
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      # The GUI is not run here: there is no screen on the runner.
+      - name: Smoke test the command line program
         run: ./target/x86_64-pc-windows-msvc/release/d30-cli.exe --version
 
       - name: Package
         shell: pwsh
         run: |
-          $name = 'd30-cli-windows-x86_64'
+          $name = 'd30-windows-x86_64'
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/d30-cli.exe, README.md, LICENSE -Destination "dist/$name"
+          Copy-Item target/x86_64-pc-windows-msvc/release/d30-cli.exe, gui/target/x86_64-pc-windows-msvc/release/d30-gui.exe, README.md, LICENSE -Destination "dist/$name"
           # Windows' own bsdtar writes a normal zip (forward slashes, one top-level folder). The
           # PowerShell zip commands do not reliably do that. The full path avoids GNU tar from Git,
           # which cannot write zip files.
@@ -95,7 +114,7 @@ jobs:
           cat > notes.md <<EOF
           Windows (x64) build of the master branch at commit ${GITHUB_SHA::7}, rebuilt automatically whenever a pull request is merged.
 
-          Unzip it and run d30-cli.exe from a terminal. The README explains how to pair the printer and find its address.
+          Unzip it. d30-gui.exe is the label designer (double-click it); d30-cli.exe is the command line program. The README explains how to pair the printer.
           The .sha256 file holds the checksum of the zip.
           EOF
           if gh release view nightly > /dev/null 2>&1; then
