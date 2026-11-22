@@ -10,13 +10,14 @@ use std::{
     io::{self, Write},
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::Duration,
 };
 
 use advmac::MacAddr6;
 
 use crate::{
     protocol::{self, Raster},
-    stock::Media,
+    stock::{LabelStock, Media},
 };
 
 /// How many times to try to connect before giving up. Each attempt that fails takes a few
@@ -54,6 +55,39 @@ pub struct Job {
     pub raster: Raster,
     /// How many copies to print, at least one.
     pub copies: u32,
+    /// A job to send after this one, once the printer has had the given time to finish it. The
+    /// printer does not say when it is done, and it could be sent the next job at once but would
+    /// not necessarily have settled where it stops by then.
+    pub then: Option<(Duration, Box<Job>)>,
+}
+
+/// How long the printer is given to find the gap and settle after a blank label, before it is sent
+/// the rest of [`position_tape`].
+pub const SETTLE: Duration = Duration::from_secs(15);
+
+/// The job that puts the tape where the program expects it to be when it counts the rows of the
+/// labels of this stock (see [`LabelStock::tape_plan`]), without any guessing by eye: a blank label
+/// in the printer's own gap mode, which finds the gap by itself and leaves the head at the start of
+/// the gap, and then, as uncut tape, the rows that carry the tape on to the middle of the gap at the
+/// tear edge. Tear off what comes out there. `None` for stocks that are not counted.
+pub fn position_tape(stock: &LabelStock) -> Option<Job> {
+    stock.counted_gap_mm()?;
+    let blank_label = Raster::blank(stock.length_dots()? as usize).ok()?;
+    let feed = Raster::blank(stock.position_feed_rows()).ok()?;
+    Some(Job {
+        media: Media::Gap,
+        raster: blank_label,
+        copies: 1,
+        then: Some((
+            SETTLE,
+            Box::new(Job {
+                media: Media::Continuous,
+                raster: feed,
+                copies: 1,
+                then: None,
+            }),
+        )),
+    })
 }
 
 #[derive(Debug)]
@@ -197,34 +231,49 @@ impl<T: Transport, W: Fn()> Worker<T, W> {
         false
     }
 
+    /// Prints the job, and the jobs that follow it, and reports how it went.
     fn print(&mut self, address: MacAddr6, job: &Job) {
+        let mut step = job;
+        loop {
+            if let Err(message) = self.print_one(address, step) {
+                self.emit(Event::PrintFailed(message));
+                return;
+            }
+            match &step.then {
+                Some((pause, next)) => {
+                    thread::sleep(*pause);
+                    step = next;
+                }
+                None => break,
+            }
+        }
+        self.emit(Event::Printed { copies: job.copies });
+    }
+
+    /// Sends one job, connecting first if there is no connection yet. On failure, what to tell
+    /// the person.
+    fn print_one(&mut self, address: MacAddr6, job: &Job) -> Result<(), String> {
         let connected = matches!(&self.link, Some((current, _)) if *current == address);
         if !connected && !self.connect(address) {
-            self.emit(Event::PrintFailed(
-                "could not connect to the printer".to_string(),
-            ));
-            return;
+            return Err("could not connect to the printer".to_string());
         }
 
         match self.send(job) {
-            Ok(()) => self.emit(Event::Printed { copies: job.copies }),
+            Ok(()) => Ok(()),
             Err(failure) if failure.nothing_sent => {
                 // The connection had most likely gone stale. Connect again, once, and send the
                 // whole job again: nothing of it reached the printer, so nothing can print twice.
                 if !self.connect(address) {
-                    self.emit(Event::PrintFailed(
+                    return Err(
                         "the connection to the printer was lost, and it could not be restored"
                             .to_string(),
-                    ));
-                    return;
+                    );
                 }
-                match self.send(job) {
-                    Ok(()) => self.emit(Event::Printed { copies: job.copies }),
-                    Err(failure) => self.emit(Event::PrintFailed(failure.error.to_string())),
-                }
+                self.send(job)
+                    .map_err(|failure| failure.error.to_string())
             }
             // Part of the job reached the printer. Sending it again could print a label twice.
-            Err(failure) => self.emit(Event::PrintFailed(failure.error.to_string())),
+            Err(failure) => Err(failure.error.to_string()),
         }
     }
 
@@ -357,6 +406,7 @@ mod tests {
             media: Media::Gap,
             raster: Raster::from_gray(&picture).unwrap(),
             copies,
+            then: None,
         }
     }
 
@@ -593,5 +643,82 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(*woken.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_job_can_be_followed_by_another_and_is_reported_once() {
+        let fake = Fake::default();
+        let printer = start(&fake);
+        let mut first = job(1);
+        let mut second = job(1);
+        second.media = Media::Continuous;
+        first.then = Some((Duration::ZERO, Box::new(second.clone())));
+        printer.send(Command::Print {
+            address: address(),
+            job: first.clone(),
+        });
+
+        let events = events_until(&printer, is_end_of_print);
+        assert_eq!(
+            events,
+            [
+                Event::Connecting { attempt: 1, of: 3 },
+                Event::Connected(address()),
+                Event::Printing { copy: 1, of: 1 },
+                Event::Printing { copy: 1, of: 1 },
+                Event::Printed { copies: 1 },
+            ]
+        );
+        // The init of each job comes before its picture, in order, over the one connection.
+        let mut expected = expected_bytes(&first);
+        expected.extend(expected_bytes(&second));
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.sent, expected);
+        assert_eq!(state.connects, 1);
+    }
+
+    #[test]
+    fn when_the_second_job_fails_halfway_it_is_not_sent_again_and_nothing_is_reported_as_printed() {
+        let fake = Fake::default();
+        // The first job is 3 writes (init and two parts of the picture), so write 5 is the first
+        // part of the picture of the second.
+        fake.state.lock().unwrap().fail_write = Some(5);
+        let printer = start(&fake);
+        let mut first = job(1);
+        first.then = Some((Duration::ZERO, Box::new(job(1))));
+        printer.send(Command::Print {
+            address: address(),
+            job: first,
+        });
+
+        let events = events_until(&printer, is_end_of_print);
+        assert!(matches!(events.last(), Some(Event::PrintFailed(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Printed { .. })));
+        assert_eq!(fake.state.lock().unwrap().connects, 1);
+    }
+
+    #[test]
+    fn positioning_the_tape_is_a_blank_label_in_gap_mode_and_then_the_feed_as_uncut_tape() {
+        let stock = LabelStock::parse("14x30").unwrap();
+        let first = position_tape(&stock).expect("the 14 x 30 mm labels are counted");
+        // A whole label of nothing, in the printer's own gap mode, so that it finds the gap.
+        assert_eq!(first.media, Media::Gap);
+        assert_eq!(first.raster.rows(), 240);
+        assert!(first.raster.bytes().iter().all(|byte| *byte == 0));
+        assert_eq!(first.copies, 1);
+        // Then, after it has had time to settle, the feed to the middle of the gap, as uncut tape.
+        let (pause, second) = first.then.as_ref().expect("there is a second step");
+        assert_eq!(*pause, SETTLE);
+        assert_eq!(second.media, Media::Continuous);
+        assert_eq!(second.raster.rows(), 93);
+        assert!(second.raster.bytes().iter().all(|byte| *byte == 0));
+        assert!(second.then.is_none());
+
+        // Labels that the printer finds by itself, and tape, have nothing to position.
+        for id in ["12x40", "14x31", "15-continuous"] {
+            assert!(position_tape(&LabelStock::parse(id).unwrap()).is_none(), "{id}");
+        }
     }
 }

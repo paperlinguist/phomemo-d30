@@ -2,7 +2,10 @@
 
 use image::GrayImage;
 
-use crate::{stock::Media, D30Error, INIT_BASE_FLAT};
+use crate::{
+    stock::{Media, PRINT_WIDTH_DOTS},
+    D30Error, INIT_BASE_FLAT,
+};
 
 /// How many rows of the picture go into one write to the printer.
 pub const ROWS_PER_WRITE: usize = 255;
@@ -63,6 +66,13 @@ impl Raster {
         })
     }
 
+    /// A picture of nothing: `rows` rows as wide as the print head, without a dot burned. Printing
+    /// it only feeds the tape.
+    pub fn blank(rows: usize) -> Result<Raster, D30Error> {
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        Raster::from_gray(&GrayImage::new(PRINT_WIDTH_DOTS, rows))
+    }
+
     /// How many bytes make up one row.
     pub fn width_bytes(&self) -> usize {
         self.width_bytes
@@ -93,6 +103,26 @@ impl Raster {
         data.append(&mut self.data);
         self.data = data;
         self.rows = rows;
+        Ok(self)
+    }
+
+    /// Leaves out the first `skip` rows, the ones the printer prints first.
+    ///
+    /// For a label whose first rows are past the print head already when it is printed (see
+    /// `LabelStock::dead_front_rows`): sending them would only move everything after them that much
+    /// further along the tape. At least one row has to be left.
+    pub fn without_first_rows(mut self, skip: usize) -> Result<Raster, D30Error> {
+        if skip == 0 {
+            return Ok(self);
+        }
+        if skip >= self.rows {
+            return Err(too_big_or_empty(&format!(
+                "the {} rows at the front of the label that cannot be printed are all of its {} rows",
+                skip, self.rows
+            )));
+        }
+        self.data.drain(..self.width_bytes * skip);
+        self.rows -= skip;
         Ok(self)
     }
 
@@ -259,6 +289,31 @@ mod tests {
         assert!(led.bytes()[..30 * 12].iter().all(|byte| *byte == 0));
         assert_eq!(&led.bytes()[30 * 12..], plain.bytes());
         assert_eq!(&image_header(&led)[12..], &[130, 0]);
+    }
+
+    #[test]
+    fn a_blank_raster_burns_nothing_and_has_the_rows_asked_for() {
+        let blank = Raster::blank(93).unwrap();
+        assert_eq!((blank.rows(), blank.width_bytes()), (93, 12));
+        assert!(blank.bytes().iter().all(|byte| *byte == 0));
+        assert_eq!(&image_header(&blank)[10..], &[12, 0, 93, 0]);
+        assert!(Raster::blank(0).is_err());
+        assert!(Raster::blank(MAX_ROWS + 1).is_err());
+    }
+
+    #[test]
+    fn the_first_rows_can_be_left_out_and_the_header_follows() {
+        let plain = Raster::from_gray(&picture(96, 100)).unwrap();
+        let cut = plain.clone().without_first_rows(24).unwrap();
+        assert_eq!(cut.rows(), 76);
+        assert_eq!(cut.bytes(), &plain.bytes()[24 * 12..]);
+        assert_eq!(&image_header(&cut)[12..], &[76, 0]);
+
+        // Nothing to leave out changes nothing; leaving out all of it is not a picture.
+        assert_eq!(plain.clone().without_first_rows(0).unwrap(), plain);
+        assert!(plain.clone().without_first_rows(100).is_err());
+        assert!(plain.clone().without_first_rows(101).is_err());
+        assert_eq!(plain.without_first_rows(99).unwrap().rows(), 1);
     }
 
     #[test]

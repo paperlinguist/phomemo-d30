@@ -17,7 +17,7 @@ use d30::{
     picture::Picture,
     printer::{self, Command, Event, Job, Printer},
     render::{self, Align, Lines, Side},
-    stock::STOCKS,
+    stock::{LabelStock, STOCKS},
 };
 use eframe::egui::{self, Color32, RichText};
 
@@ -182,6 +182,8 @@ pub struct App {
     connection: Connection,
     /// A print is on its way to the printer.
     printing: bool,
+    /// What is on its way to the printer is the job that positions the tape, not a label.
+    positioning: bool,
     status: Status,
     /// What to check when the printer cannot be reached.
     help: Option<String>,
@@ -259,6 +261,7 @@ impl App {
             printer,
             connection: Connection::Disconnected,
             printing: false,
+            positioning: false,
             status: Status {
                 level: Level::Info,
                 text: match choice {
@@ -389,6 +392,7 @@ impl App {
                 Event::ConnectFailed(error) => {
                     self.connection = Connection::Failed;
                     self.printing = false;
+                    self.positioning = false;
                     let help = self
                         .address()
                         .map(|address| bt::connection_help(&Self::address_text(address)));
@@ -407,7 +411,24 @@ impl App {
                 }
                 Event::Printing { copy, of } => {
                     self.printing = true;
-                    self.say(Level::Info, format!("Printing label {copy} of {of}…"));
+                    if self.positioning {
+                        self.say(
+                            Level::Info,
+                            "Positioning the tape: a blank label comes out first, then the tape \
+                             moves on a little. This takes about 20 seconds…",
+                        );
+                    } else {
+                        self.say(Level::Info, format!("Printing label {copy} of {of}…"));
+                    }
+                }
+                Event::Printed { .. } if self.positioning => {
+                    self.printing = false;
+                    self.positioning = false;
+                    self.say(
+                        Level::Good,
+                        "The tape is positioned. Tear off what came out at the printer's edge: \
+                         the printed line is on the edge.",
+                    );
                 }
                 Event::Printed { copies } => {
                     self.printing = false;
@@ -423,6 +444,7 @@ impl App {
                 }
                 Event::PrintFailed(error) => {
                     self.printing = false;
+                    self.positioning = false;
                     // When the print failed because the printer could not be reached, the
                     // message about that, which says why, is already on show. Keep it.
                     if !matches!(self.connection, Connection::Failed) {
@@ -458,13 +480,8 @@ impl App {
         let Some(Ok(preview)) = &self.preview else {
             return;
         };
-        let stock = &preview.stock;
-        let raster = preview
-            .rendered
-            .raster()
-            .and_then(|raster| raster.with_lead_rows(self.settings.lead_rows(stock)))
-            .and_then(|raster| raster.with_blank_rows(self.settings.feed_rows(stock)));
-        let raster = match raster {
+        let plan = self.settings.tape_plan(&preview.stock);
+        let raster = match preview.rendered.raster_for(&plan) {
             Ok(raster) => raster,
             Err(error) => {
                 let text = error.to_string();
@@ -473,13 +490,31 @@ impl App {
             }
         };
         let job = Job {
-            media: stock.media,
+            media: plan.media,
             raster,
             copies: self.settings.copies.max(1),
+            then: None,
         };
         self.printing = true;
         self.help = None;
         self.say(Level::Info, "Sending the label to the printer…");
+        self.printer.send(Command::Print { address, job });
+    }
+
+    /// Puts the tape where the program expects it to be for labels that it keeps count of: a
+    /// blank label, which the printer finds the gap for itself, and then a little more tape.
+    fn position_tape(&mut self, stock: &LabelStock) {
+        let Some(address) = self.address() else {
+            self.say(Level::Bad, "Choose a printer first.");
+            return;
+        };
+        let Some(job) = printer::position_tape(stock) else {
+            return;
+        };
+        self.printing = true;
+        self.positioning = true;
+        self.help = None;
+        self.say(Level::Info, "Sending the blank label to the printer…");
         self.printer.send(Command::Print { address, job });
     }
 
@@ -735,6 +770,37 @@ impl App {
                                 .suffix(" mm"),
                         );
                     });
+                }
+            }
+            Ok(stock) if stock.counted_gap_mm().is_some() => {
+                // The program keeps track of these labels itself, which only works if the tape
+                // is left alone between two labels.
+                ui.label(
+                    RichText::new(
+                        "These labels have a wide gap, so the program keeps track of where \
+                         they are. Tear each label off at the printer's edge (the printed \
+                         line is then at the edge), and do not pull the tape out or press \
+                         the printer's button. The first 3 mm of each label cannot be \
+                         printed, so the text keeps that far from the ends. After a new \
+                         roll, or if the tape was moved, press Position the tape.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let ready = self.address().is_some()
+                    && !self.printing
+                    && !matches!(self.connection, Connection::Connecting { .. });
+                let response = ui.add_enabled(ready, egui::Button::new("Position the tape"));
+                let response = if self.address().is_none() {
+                    response.on_disabled_hover_text("Choose a printer first")
+                } else {
+                    response.on_hover_text(
+                        "Feeds a blank label, so that the printer finds the gap, and then a \
+                         little more tape. Tear off what comes out at the printer's edge.",
+                    )
+                };
+                if response.clicked() {
+                    self.position_tape(&stock);
                 }
             }
             Ok(_) => {}

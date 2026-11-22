@@ -7,6 +7,7 @@ use std::{
     io::{self, Cursor, Write},
     path::PathBuf,
     process::{exit, Command, Stdio},
+    thread,
 };
 
 use advmac::{MacAddr6, MacAddrFormat, ParseError};
@@ -14,6 +15,7 @@ use clap::{Parser, Subcommand};
 use d30::bt;
 use d30::fonts::{FontSource, FontSpec, Fonts};
 use d30::picture::{Picture, Tone};
+use d30::printer::{self, Job};
 use d30::render::{self, Align, Element, Label, Lines, PictureElement, Side, TextElement};
 use d30::stock::{LabelStock, Media, DOTS_PER_MM, STOCKS};
 use d30::D30Scale;
@@ -45,6 +47,24 @@ enum Commands {
     ListLabels,
     /// List the fonts that labels can use
     ListFonts,
+    /// Put the tape where this program expects it for labels with a wide gap (14x30): feeds a
+    /// blank label, so that the printer finds the gap, and then a little more tape. Tear off what
+    /// comes out at the printer's edge
+    PositionTape(ArgsPositionTape),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+struct ArgsPositionTape {
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(short, long)]
+    device: Option<String>,
+    /// The label stock in the printer: a name from `list-labels`
+    #[arg(short, long, default_value = "14x30")]
+    label: String,
+    #[arg(long)]
+    #[arg(default_value = "10")]
+    max_retries: usize,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -98,7 +118,10 @@ struct ArgsPrintText {
     /// How high the picture is, in mm. As high as the label allows (less the margins) by default
     #[arg(long)]
     picture_height: Option<f32>,
-    /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by default
+    /// How the printer tells labels apart: gap, continuous or marks. The label stock's own by
+    /// default, except for labels whose gap is known (14x30), which are printed as continuous
+    /// tape with the rows counted by this program, because the printer cannot print the whole
+    /// of a label with a wide gap by itself
     #[arg(long)]
     media: Option<Media>,
     /// Blank lines to print before the label. The first lines a printer prints can come out
@@ -108,7 +131,9 @@ struct ArgsPrintText {
     lead_in_lines: Option<usize>,
     /// Blank lines to feed after printing, to push the label far enough out of the printer to tear
     /// it off with its text in the middle. Uncut tape gets 134 by default (about 17 mm), precut
-    /// labels none
+    /// labels none, except for labels whose gap is known (14x30), which get the gap and the part
+    /// of the label that cannot be printed (88 lines), so that the middle of the gap is at the
+    /// tear edge
     #[arg(long)]
     feed_lines: Option<usize>,
     /// Also save the label as a picture at actual size (one pixel for each dot)
@@ -425,6 +450,119 @@ enum CLIError {
     ParentDirectoryMissing { task: String },
 }
 
+/// Connects to the printer, trying again when it does not answer. Gives up for good (and ends the
+/// program) after `max_retries` more tries. With `dry_run` nothing is connected and `None` comes back.
+fn connect_with_retries(
+    addr: MacAddr6,
+    max_retries: usize,
+    dry_run: bool,
+) -> Option<bt::RfcommStream> {
+    println!("Connecting...");
+    for retries in 0.. {
+        info!("Retry #{}", retries);
+        if retries > max_retries {
+            error!(
+                "Failed to connect after {} retries!\n\
+                 The printer never answered. Usual causes:\n\
+                 - it is switched off, asleep, or out of range\n\
+                 {}",
+                max_retries,
+                bt::connection_help(&addr.format_string(MacAddrFormat::ColonNotation)),
+            );
+            exit(1);
+        }
+        if dry_run {
+            return None;
+        }
+
+        match bt::connect(addr).context(BluetoothBackendSnafu {
+            task: "connecting to the printer".to_string(),
+        }) {
+            Ok(socket) => return Some(socket),
+            Err(e) => {
+                error!(
+                    "Error while trying to connect, on attempt #{}:\n{}",
+                    retries, e
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Sends one job to the printer: its init sequence, then its picture in chunks of 255 rows.
+/// Without a socket (a dry run) nothing is sent.
+fn send_job(socket: &mut Option<bt::RfcommStream>, job: &Job) -> Result<(), CLIError> {
+    let Some(socket) = socket else {
+        return Ok(());
+    };
+    socket
+        .write_all(&d30::protocol::init_sequence(job.media))
+        .context(IOSnafu {
+            task: "send magic init bytes".to_string(),
+        })?;
+    let writes = d30::protocol::image_writes(&job.raster);
+    for _ in 0..job.copies {
+        for write in &writes {
+            socket.write_all(write).context(IOSnafu {
+                task: "write image".to_string(),
+            })?;
+            socket.flush().context(IOSnafu {
+                task: "flush socket".to_string(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Puts the tape where this program expects it to be for labels that it keeps count of: a blank
+/// label in the printer's own gap mode, which finds the gap, then the feed to the middle of the gap.
+fn cmd_position_tape(config: &mut Config, args: &ArgsPositionTape) -> Result<(), CLIError> {
+    trace!("Call: cmd_position_tape");
+    let dry_run = config.dry_run.unwrap_or(false) || args.dry_run;
+    let addr = get_addr(config, args.device.clone())?;
+    let stock = LabelStock::parse(&args.label).map_err(|reason| CLIError::BadOption { reason })?;
+    let Some(first) = printer::position_tape(&stock) else {
+        return Err(CLIError::BadOption {
+            reason: format!(
+                "{} is not a label that this program keeps count of, so there is nothing to \
+                 position: the printer finds those labels by itself. This is for labels with a \
+                 wide gap, such as 14x30",
+                stock.id
+            ),
+        });
+    };
+
+    let mut socket = connect_with_retries(addr, args.max_retries, dry_run);
+    let mut job = &first;
+    loop {
+        println!(
+            "{}",
+            if job.media == Media::Gap {
+                "Sending a blank label, so that the printer finds the gap..."
+            } else {
+                "Moving the tape on to the middle of the gap..."
+            }
+        );
+        send_job(&mut socket, job)?;
+        let Some((pause, next)) = &job.then else {
+            break;
+        };
+        println!(
+            "Waiting {} seconds for the printer to settle...",
+            pause.as_secs()
+        );
+        if !dry_run {
+            thread::sleep(*pause);
+        }
+        job = next;
+    }
+    println!(
+        "Done. Tear off what came out at the printer's edge: the printed line is on the edge."
+    );
+    Ok(())
+}
+
 fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> {
     trace!("Call: cmd_print");
     let mut args = args.to_owned();
@@ -447,7 +585,8 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
         }
     }
     let stock = LabelStock::parse(&args.label).map_err(|reason| CLIError::BadOption { reason })?;
-    let media = args.media.unwrap_or(stock.media);
+    let plan = stock.tape_plan(args.media, args.lead_in_lines, args.feed_lines);
+    let media = plan.media;
 
     // Looking through the installed fonts takes a moment, so only do it when needed: for a font
     // that is chosen by its name, and for text that may have emoji, which an installed font draws.
@@ -520,21 +659,7 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
         preview.height() * 4,
         imageops::FilterType::Nearest,
     ));
-    let raster = rendered
-        .raster()
-        .and_then(|raster| {
-            raster.with_lead_rows(
-                args.lead_in_lines
-                    .unwrap_or_else(|| label.stock.default_lead_rows()),
-            )
-        })
-        .and_then(|raster| {
-            raster.with_blank_rows(
-                args.feed_lines
-                    .unwrap_or_else(|| label.stock.default_feed_rows()),
-            )
-        })
-        .context(D30LibSnafu)?;
+    let raster = rendered.raster_for(&plan).context(D30LibSnafu)?;
     if show_preview {
         let should_accept = match cmd_show_preview(config.preview.clone(), preview_image)? {
             Accepted::Yes => true,
@@ -551,41 +676,7 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
         }
     }
 
-    let mut socket: Option<bt::RfcommStream> = None;
-    println!("Connecting...");
-    'retry: for retries in 0.. {
-        info!("Retry #{}", retries);
-        if retries > args.max_retries {
-            error!(
-                "Failed to connect after {} retries!\n\
-                 The printer never answered. Usual causes:\n\
-                 - it is switched off, asleep, or out of range\n\
-                 {}",
-                args.max_retries,
-                bt::connection_help(&addr.format_string(MacAddrFormat::ColonNotation)),
-            );
-            exit(1);
-        }
-        if dry_run {
-            break 'retry;
-        }
-
-        match bt::connect(addr).context(BluetoothBackendSnafu {
-            task: "connecting to the printer".to_string(),
-        }) {
-            Ok(new_socket) => {
-                socket = Some(new_socket);
-                break 'retry;
-            }
-            Err(e) => {
-                error!(
-                    "Error while trying to connect, on attempt #{}:\n{}",
-                    retries, e
-                );
-                continue 'retry;
-            }
-        }
-    }
+    let mut socket = connect_with_retries(addr, args.max_retries, dry_run);
 
     debug!("Init connection");
     if let Some(socket) = &mut socket {
@@ -633,6 +724,21 @@ fn cmd_list_labels() {
          labels 12 mm wide and 35 mm long, or `--label 13-continuous` for uncut tape 13 mm wide.",
         STOCKS[0].id
     );
+    let counted: Vec<&str> = STOCKS
+        .iter()
+        .filter(|stock| stock.counted_gap_mm().is_some())
+        .map(|stock| stock.id.as_ref())
+        .collect();
+    if !counted.is_empty() {
+        println!(
+            "\n{}: the labels have a wide gap, and the printer cannot print the whole of a label \
+             like that by itself, so this program counts the rows and keeps track of the tape. \
+             Tear each label off at the middle of the gap, at the edge of the printer, and do not \
+             pull the tape out or press the printer's button. The first 3 mm of each label cannot \
+             be printed, so text and pictures keep that far from the ends.",
+            counted.join(", ")
+        );
+    }
 }
 
 fn cmd_list_fonts() {
@@ -703,6 +809,7 @@ async fn main() -> Result<(), CLIError> {
         Commands::ListPrinters => cmd_list_printers()?,
         Commands::ListLabels => cmd_list_labels(),
         Commands::ListFonts => cmd_list_fonts(),
+        Commands::PositionTape(args) => cmd_position_tape(&mut config, &args)?,
     }
 
     Ok(())

@@ -6,7 +6,7 @@ use d30::{
     fonts::{FontSource, FontSpec},
     picture::{Picture, Tone},
     render::{Align, Element, Label, Lines, PictureElement, Side, TextElement},
-    stock::{LabelStock, DEFAULT_STOCK_ID},
+    stock::{LabelStock, TapePlan, DEFAULT_STOCK_ID},
     D30Scale,
 };
 use serde::{Deserialize, Serialize};
@@ -114,14 +114,10 @@ impl LabelSettings {
         Ok(label)
     }
 
-    /// Blank rows to print before the label.
-    pub fn lead_rows(&self, stock: &LabelStock) -> usize {
-        self.lead_in.unwrap_or_else(|| stock.default_lead_rows())
-    }
-
-    /// Blank rows to feed after the label.
-    pub fn feed_rows(&self, stock: &LabelStock) -> usize {
-        self.feed.unwrap_or_else(|| stock.default_feed_rows())
+    /// How the rows of the label go onto the tape: the blank rows before and after it are what
+    /// was set, or what the stock needs.
+    pub fn tape_plan(&self, stock: &LabelStock) -> TapePlan {
+        stock.tape_plan(None, self.lead_in, self.feed)
     }
 }
 
@@ -430,20 +426,24 @@ mod tests {
         let mut settings = LabelSettings::default();
         let precut = LabelStock::parse("12x40").unwrap();
         let tape = LabelStock::parse("15-continuous").unwrap();
+        let counted = LabelStock::parse("14x30").unwrap();
+        let rows = |plan: TapePlan| (plan.lead_rows, plan.feed_rows);
+        assert_eq!(rows(settings.tape_plan(&precut)), (0, 0));
         assert_eq!(
-            (settings.lead_rows(&precut), settings.feed_rows(&precut)),
-            (0, 0)
-        );
-        assert_eq!(
-            (settings.lead_rows(&tape), settings.feed_rows(&tape)),
+            rows(settings.tape_plan(&tape)),
             (tape.default_lead_rows(), tape.default_feed_rows())
+        );
+        // The 14 x 30 mm labels are counted: nothing before, and the gap plus the part of the
+        // label that cannot be printed (8 mm + 3 mm = 88 rows) after, printed as uncut tape.
+        let plan = settings.tape_plan(&counted);
+        assert_eq!(
+            (plan.media, rows(plan)),
+            (d30::stock::Media::Continuous, (0, 88))
         );
         settings.lead_in = Some(5);
         settings.feed = Some(9);
-        assert_eq!(
-            (settings.lead_rows(&tape), settings.feed_rows(&tape)),
-            (5, 9)
-        );
+        assert_eq!(rows(settings.tape_plan(&tape)), (5, 9));
+        assert_eq!(rows(settings.tape_plan(&counted)), (5, 9));
     }
 
     #[test]

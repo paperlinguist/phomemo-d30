@@ -14,7 +14,7 @@ use crate::{
     fonts::{has_glyph, FontSpec, Fonts},
     picture::{Picture, Tone},
     protocol::{Raster, MAX_ROWS},
-    stock::{mm_to_dots, LabelStock, PRINT_WIDTH_DOTS},
+    stock::{mm_to_dots, LabelStock, TapePlan, PRINT_WIDTH_DOTS},
     D30Error, D30Scale,
 };
 
@@ -206,6 +206,16 @@ impl Rendered {
     pub fn raster(&self) -> Result<Raster, D30Error> {
         Raster::from_gray(&imageops::rotate270(&self.canvas))
     }
+
+    /// The rows to send for one copy of the label on the tape as `plan` lays it out: the label
+    /// without the rows at its front that cannot be printed, with the blank rows before and after
+    /// it. See [`LabelStock::tape_plan`].
+    pub fn raster_for(&self, plan: &TapePlan) -> Result<Raster, D30Error> {
+        self.raster()?
+            .without_first_rows(plan.skip_rows)?
+            .with_lead_rows(plan.lead_rows)?
+            .with_blank_rows(plan.feed_rows)
+    }
 }
 
 /// Draws `label`, using `fonts` to find its fonts.
@@ -217,6 +227,9 @@ impl Rendered {
 pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
     let height = PRINT_WIDTH_DOTS;
     let fixed_length = fixed_length(label)?;
+    // How far from each end of the label the content has to stay: where the label's front cannot be
+    // printed, that part, and the same at the other end so that the content is in the middle.
+    let keep_clear = label.stock.dead_front_rows() as f32;
 
     let texts: Vec<&TextElement> = label
         .elements
@@ -230,7 +243,12 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
         .elements
         .iter()
         .filter_map(|element| match element {
-            Element::Picture(picture) => Some(SizedPicture::new(picture, height, fixed_length)),
+            Element::Picture(picture) => Some(SizedPicture::new(
+                picture,
+                height,
+                fixed_length,
+                keep_clear,
+            )),
             _ => None,
         })
         .collect();
@@ -254,10 +272,27 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
     // What is left of a label that has a length of its own, for the text.
     let text_room = fixed_length
         .map(|length| (length as f32 - left_extent as f32 - right_extent as f32).max(1.0));
+    // A text is kept clear of the ends of the label by its margin. Where that is less than has to
+    // be kept clear, its room is made smaller by the difference (at an end with a picture, the
+    // picture's margin has done that already).
+    let insets = |text: &TextElement| {
+        let more = (keep_clear - text.margin.max(0.0)).max(0.0);
+        (
+            if left.is_empty() { more } else { 0.0 },
+            if right.is_empty() { more } else { 0.0 },
+        )
+    };
     let mut blocks = Vec::new();
     if !alone {
         for text in &texts {
-            blocks.push((*text, lay_out(text, fonts, text_room, height as f32)?));
+            let (inset_left, inset_right) = insets(text);
+            let room = text_room.map(|room| (room - inset_left - inset_right).max(1.0));
+            blocks.push((
+                *text,
+                inset_left,
+                inset_right,
+                lay_out(text, fonts, room, height as f32)?,
+            ));
         }
     }
 
@@ -278,7 +313,7 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
         None => {
             let text = blocks
                 .iter()
-                .map(|(text, block)| (block.width as f32 + 2.0 * text.margin).ceil() as u64)
+                .map(|(text, _, _, block)| (block.width as f32 + 2.0 * text.margin).ceil() as u64)
                 .max()
                 .unwrap_or(1)
                 .max(1);
@@ -304,8 +339,14 @@ pub fn render(label: &Label, fonts: &Fonts) -> Result<Rendered, D30Error> {
         }
     } else {
         let text_width = (length as f32 - left_extent as f32 - right_extent as f32).max(1.0);
-        for (text, block) in &blocks {
-            draw(&mut canvas, text, block, left_extent as f32, text_width);
+        for (text, inset_left, inset_right, block) in &blocks {
+            draw(
+                &mut canvas,
+                text,
+                block,
+                left_extent as f32 + inset_left,
+                (text_width - inset_left - inset_right).max(1.0),
+            );
         }
         let mut left_edge = 0;
         for picture in &left {
@@ -335,7 +376,14 @@ struct SizedPicture<'a> {
 
 impl<'a> SizedPicture<'a> {
     /// `band` is how high the label is, `fixed_length` how long, if it has a length of its own.
-    fn new(element: &'a PictureElement, band: u32, fixed_length: Option<u32>) -> Self {
+    /// `keep_clear` is how far from the ends of the label the picture has to stay at least, which
+    /// can be more than its margin (the margin above and below the picture is its own).
+    fn new(
+        element: &'a PictureElement,
+        band: u32,
+        fixed_length: Option<u32>,
+        keep_clear: f32,
+    ) -> Self {
         // (`max` and `clamp` leave a NaN out, which is how a size that is not a number ends up as
         // the smallest there is.)
         let margin = element.margin.max(0.0);
@@ -347,9 +395,12 @@ impl<'a> SizedPicture<'a> {
         let shape = element.picture.width() as f32 / element.picture.height() as f32;
         let mut height = wanted.round().max(1.0);
         let mut width = (height * shape).round().max(1.0);
-        // On a label of fixed length the picture is never wider than the label (less its margin).
+        // On a label of fixed length the picture is never wider than the label (less its margin, or
+        // less what has to be kept clear at both ends if that is more).
         if let Some(length) = fixed_length {
-            let room = (length as f32 - margin).floor().max(1.0);
+            let room = (length as f32 - margin.max(2.0 * keep_clear))
+                .floor()
+                .max(1.0);
             if width > room {
                 width = room;
                 height = (width / shape).round().max(1.0);
@@ -359,7 +410,7 @@ impl<'a> SizedPicture<'a> {
             element,
             width: width as u32,
             height: height as u32,
-            margin: margin.round() as u32,
+            margin: margin.max(keep_clear).round() as u32,
         }
     }
 
@@ -1793,5 +1844,96 @@ mod tests {
             render(&label, &Fonts::embedded()).err().unwrap(),
             D30Error::FontNotFound { .. }
         ));
+    }
+
+    // ---- labels whose front cannot be printed (the 14 x 30 mm labels) ---------------------------
+
+    /// How far from each end of the 14 x 30 mm label (240 dots) the content has to stay.
+    const KEEP_CLEAR: u32 = 24;
+
+    #[test]
+    fn text_stays_clear_of_both_ends_of_a_label_whose_front_cannot_be_printed() {
+        assert_eq!(stock("14x30").dead_front_rows(), KEEP_CLEAR as usize);
+        for text in ["Hello", "Flour and sugar and more", "W"] {
+            for margin in [0.0, 15.0] {
+                let mut label = Label::text(stock("14x30"), text);
+                text_mut(&mut label).margin = margin;
+                let (first, last) = ink_columns(&draw_label(&label)).unwrap();
+                assert!(first >= KEEP_CLEAR, "{text:?} margin {margin}: from {first}");
+                assert!(
+                    last < 240 - KEEP_CLEAR,
+                    "{text:?} margin {margin}: to {last}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wider_margin_than_what_has_to_be_kept_clear_still_counts() {
+        let mut label = Label::text(stock("14x30"), "Hello");
+        text_mut(&mut label).margin = 40.0;
+        let (first, last) = ink_columns(&draw_label(&label)).unwrap();
+        assert!(first >= 40 - 1 && last < 240 - 40 + 1, "{first} {last}");
+    }
+
+    #[test]
+    fn the_part_that_cannot_be_printed_costs_length_but_not_height() {
+        // A word that the height of the label limits, not its length, comes out the same size on
+        // a label that has such a part and on one that has not.
+        let tall = |id: &str| ink_rows(&render_text(id, "H")).unwrap();
+        assert_eq!(tall("14x30"), tall("14x31"));
+        // And text that is limited by the length is smaller than on a label without the part.
+        let long = "Pepper and salt and rice";
+        let on = |id: &str| ink_columns(&render_text(id, long)).unwrap();
+        let (first, last) = on("14x30");
+        let (plain_first, plain_last) = on("14x31");
+        assert!(last - first < plain_last - plain_first);
+    }
+
+    #[test]
+    fn a_picture_stays_clear_of_the_ends_of_such_a_label() {
+        for margin in [0.0, 15.0] {
+            let alone = pictures_only(
+                "14x30",
+                vec![picture_element(black(400, 40), Side::Left, margin)],
+            );
+            let (first, last) = ink_columns(&draw_label(&alone)).unwrap();
+            assert!(first >= KEEP_CLEAR && last < 240 - KEEP_CLEAR, "{first} {last}");
+
+            let beside_text = text_and_pictures(
+                "14x30",
+                "Hi",
+                vec![
+                    picture_element(black(20, 20), Side::Left, margin),
+                    picture_element(black(20, 20), Side::Right, margin),
+                ],
+            );
+            let (first, last) = ink_columns(&draw_label(&beside_text)).unwrap();
+            assert!(first >= KEEP_CLEAR && last < 240 - KEEP_CLEAR, "{first} {last}");
+        }
+    }
+
+    #[test]
+    fn the_rows_of_a_counted_label_are_one_label_and_its_gap_long_and_leave_out_its_front() {
+        let stock = stock("14x30");
+        let plan = stock.tape_plan(None, None, None);
+        let rendered = render_text("14x30", "Hello");
+        let all = rendered.raster().unwrap();
+        let raster = rendered.raster_for(&plan).unwrap();
+
+        // 30 mm of label and 8 mm of gap, 8 rows to the millimetre.
+        assert_eq!(all.rows(), 240);
+        assert_eq!(raster.rows(), 304);
+        // The label's rows start 24 rows in, and the rest of the 304 are blank.
+        let row = all.width_bytes();
+        assert_eq!(&raster.bytes()[..216 * row], &all.bytes()[24 * row..]);
+        assert!(raster.bytes()[216 * row..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn labels_that_are_left_to_the_printer_are_sent_whole() {
+        let rendered = render_text("12x40", "Hello");
+        let plan = stock("12x40").tape_plan(None, None, None);
+        assert_eq!(rendered.raster_for(&plan).unwrap(), rendered.raster().unwrap());
     }
 }
